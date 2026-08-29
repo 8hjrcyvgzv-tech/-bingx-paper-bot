@@ -1,5 +1,5 @@
 {
   "name": "bingx-paper-bot",
-  "main": "worker.js",
+  "main": "worker2.js",
   "compatibility_date": "2026-08-28"
 }
