@@ -202,7 +202,7 @@ async function sendNtfy(env, data) {
     method: "POST",
     headers: {
       "content-type": "text/plain; charset=utf-8",
-      "title": "BingX 8/10+ Sinyal",
+      "title": "BingX 7/10+ Sinyal",
       "priority": "high",
       "tags": "chart_with_upwards_trend",
     },
