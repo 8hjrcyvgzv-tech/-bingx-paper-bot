@@ -1,6 +1,6 @@
 const CFG = {
   symbols: ["ETH-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT", "BNB-USDT"],
-  minScore: 8,
+  minScore: 7,
   leverage: 5,
   paperBalance: 200,
   maxMarginPct: 0.10,
