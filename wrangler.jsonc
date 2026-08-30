@@ -1,6 +1,6 @@
 {
   "name": "bingx-paper-bot",
-  "main": "v25.js",
+  "main": "v26.js",
   "compatibility_date": "2026-08-28",
   "keep_vars": true,
   "triggers": {
