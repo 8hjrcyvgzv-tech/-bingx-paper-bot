@@ -1,9 +1,17 @@
 {
   "name": "bingx-paper-bot",
-  "main": "v26.js",
+  "main": "worker_top100_v26_cpu_fix.js",
   "compatibility_date": "2026-08-28",
   "keep_vars": true,
   "triggers": {
-    "crons": ["*/2 * * * *"]
+    "crons": ["* * * * *"]
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "persist": true
+    }
   }
 }
