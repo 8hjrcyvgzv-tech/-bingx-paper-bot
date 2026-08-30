@@ -1,6 +1,6 @@
 {
   "name": "bingx-paper-bot",
-  "main": "worker_top100_v26_cpu_fix.js",
+  "main": "worker_top100_v27_ntfy_retry.js",
   "compatibility_date": "2026-08-28",
   "keep_vars": true,
   "triggers": {
