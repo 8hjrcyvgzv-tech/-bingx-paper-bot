@@ -1,11 +1,29 @@
 {
   "name": "bingx-paper-bot",
-  "main": "worker_top100_v213_2min_signal.js",
+  "main": "worker_top100_v214_auto_paper.js",
   "compatibility_date": "2026-08-28",
   "keep_vars": true,
   "triggers": {
-    "crons": ["* * * * *"]
+    "crons": [
+      "* * * * *"
+    ]
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PAPER_TRACKER",
+        "class_name": "PaperTracker"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "paper-v1",
+      "new_sqlite_classes": [
+        "PaperTracker"
+      ]
+    }
+  ],
   "observability": {
     "enabled": true,
     "logs": {
