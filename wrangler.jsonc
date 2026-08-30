@@ -1,6 +1,6 @@
 {
   "name": "bingx-paper-bot",
-  "main": "main": "worker_top100_v23 3.js",
+  "main": "worker_top100_v24.js",
   "compatibility_date": "2026-08-28",
   "triggers": {
     "crons": ["*/2 * * * *"]
