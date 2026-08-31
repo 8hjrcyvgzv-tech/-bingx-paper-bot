@@ -1,6 +1,6 @@
 {
   "name": "bingx-paper-bot",
-  "main": "worker_top100_v216_usd_pnl.js",
+  "main": "worker_top100_v217_usd_sign_fix.js",
   "compatibility_date": "2026-08-28",
   "keep_vars": true,
   "triggers": {
