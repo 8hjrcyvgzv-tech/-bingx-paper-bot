@@ -1,12 +1,10 @@
 {
   "name": "bingx-paper-bot",
-  "main": "worker_top100_v218_quality_gate.js",
+  "main": "worker_top100_v219_balanced_gate.js",
   "compatibility_date": "2026-08-28",
   "keep_vars": true,
   "triggers": {
-    "crons": [
-      "* * * * *"
-    ]
+    "crons": ["* * * * *"]
   },
   "durable_objects": {
     "bindings": [
