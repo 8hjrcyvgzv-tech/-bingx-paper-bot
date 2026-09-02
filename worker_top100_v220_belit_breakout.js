@@ -21,6 +21,7 @@ function esc(v){ return String(v??"").replace(/[&<>\"]/g,c=>({"&":"&amp;","<":"&
 
 function isSyntheticSymbol(symbol){
   const s=String(symbol||"").toUpperCase();
+  if(s.startsWith("NCSK"))return true;
   return /(?:NCCO|BRENT|WTI|OIL|XAU|XAG|GOLD|SILVER|NASDAQ|SP500|DOW|DJI|FOREX)/.test(s);
 }
 
@@ -81,7 +82,9 @@ function rejectReasons(x){
 }
 
 function upgradeData(raw){
-  const all=(Array.isArray(raw?.all)?raw.all:[]).map(x=>({
+  const all=(Array.isArray(raw?.all)?raw.all:[])
+    .filter(x=>!isSyntheticSymbol(x?.symbol))
+    .map(x=>({
     ...x,
     v219Qualifies:isV219Signal(x),
     qualifies:isV219Signal(x),
@@ -241,6 +244,24 @@ function page(data,paper,migration){
 }
 
 export class PaperTracker extends BasePaperTracker {
+  async loadTrades(){
+    const trades=await super.loadTrades();
+    const clean=trades.filter(t=>!isSyntheticSymbol(t?.symbol));
+    const removed=trades.filter(t=>isSyntheticSymbol(t?.symbol));
+
+    if(removed.length){
+      const archived=(await this.state.storage.get("archive_v220_synthetic"))||[];
+      const existingIds=new Set(archived.map(t=>t?.id).filter(Boolean));
+      const freshRemoved=removed.filter(t=>!t?.id||!existingIds.has(t.id));
+      if(freshRemoved.length){
+        await this.state.storage.put("archive_v220_synthetic",[...archived,...freshRemoved]);
+      }
+      await this.saveTrades(clean);
+    }
+
+    return clean;
+  }
+
   async ensureV219Migration(){
     const marker=await this.state.storage.get("v219_migrated");
     if(marker)return marker;
@@ -264,7 +285,10 @@ export class PaperTracker extends BasePaperTracker {
     const before=new Set(trades.map(t=>t.id));
     const dirCount={LONG:open.filter(t=>t.direction==="LONG").length,SHORT:open.filter(t=>t.direction==="SHORT").length};
     const selected=[];
-    const sorted=(Array.isArray(signals)?signals:[]).filter(isV220Signal).sort((a,b)=>(Number(b.entryQuality)||0)-(Number(a.entryQuality)||0)||(Number(b.setupQuality)||0)-(Number(a.setupQuality)||0)||(Number(b.score)||0)-(Number(a.score)||0));
+    const sorted=(Array.isArray(signals)?signals:[])
+      .filter(s=>!isSyntheticSymbol(s?.symbol))
+      .filter(isV220Signal)
+      .sort((a,b)=>(Number(b.entryQuality)||0)-(Number(a.entryQuality)||0)||(Number(b.setupQuality)||0)-(Number(a.setupQuality)||0)||(Number(b.score)||0)-(Number(a.score)||0));
     for(const s of sorted){
       if(!free||selected.length>=2)break;
       if(dirCount[s.direction]>=V219.maxSameDirection)continue;
@@ -303,6 +327,7 @@ export class PaperTracker extends BasePaperTracker {
       const history=(await this.state.storage.get("v219_alerts"))||{};
       const allowed=[];
       for(const s of (Array.isArray(body?.signals)?body.signals:[])){
+        if(isSyntheticSymbol(s?.symbol))continue;
         if(!isV220Signal(s))continue;
         const key=`${s.symbol}:${s.direction}:${s.belitStage||"CLASSIC"}`;
         if(now-Number(history[key]||0)<V219.alertCooldownMs)continue;
@@ -318,6 +343,7 @@ export class PaperTracker extends BasePaperTracker {
       const history=(await this.state.storage.get("v220_watch_alerts"))||{};
       const allowed=[];
       for(const s of (Array.isArray(body?.watch)?body.watch:[])){
+        if(isSyntheticSymbol(s?.symbol))continue;
         if(!s?.belitWatchCandidate)continue;
         const key=`${s.symbol}:${s.direction}:${s.belitStage}:${s.boundary}`;
         if(now-Number(history[key]||0)<V219.watchCooldownMs)continue;
