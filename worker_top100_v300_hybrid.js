@@ -3,7 +3,7 @@ import { enrichHybridData, isV300Signal, stageLabel, publicStatusLabel } from ".
 
 const BASE_URL = "https://bingx-paper-bot.yasinaltas39.workers.dev";
 const V219 = {
-  version: "V3.0.2",
+  version: "V3.1",
   minScore: 5.5,
   minAdx4h: 22,
   minVolumeRatio: 1.05,
@@ -30,7 +30,7 @@ function marginForSignal(x){ return marginForQuality(x?.executionScore??x?.entry
 function errInfo(stage,e){
   const message=String(e?.message||e||"bilinmeyen hata");
   const stack=String(e?.stack||"").split("\n").slice(0,4).join(" | ");
-  console.error(`V3.0.2 ${stage}`,stack||message);
+  console.error(`V3.1 ${stage}`,stack||message);
   return {stage,message,stack};
 }
 function emptyPaper(error=null){return {ok:false,stats:{open:0,closed:0,winRatePct:0,totalOpenUSDT:0},trades:[],error};}
@@ -107,12 +107,12 @@ function upgradeData(raw){
     v300BaseEligible:!x?.error && ["LONG","SHORT"].includes(x?.direction) && !isSyntheticSymbol(x?.symbol) && Boolean(x?.riskOk) && Boolean(x?.rangeOk),
     v219RejectReasons:rejectReasons(x),
   }));
-  return {...raw,version:"TOP100_V3_0_HYBRID",minScore:7.5,signals:[],all};
+  return {...raw,version:"BINGX_WIDE_V3_1",minScore:7.5,signals:[],all};
 }
 
 async function scanThroughBase(env,focusSymbols=[]){
   const u=new URL(`${BASE_URL}/json`);
-  const focus=(Array.isArray(focusSymbols)?focusSymbols:[]).map(String).filter(Boolean).slice(0,5);
+  const focus=(Array.isArray(focusSymbols)?focusSymbols:[]).map(String).filter(Boolean).slice(0,10);
   if(focus.length)u.searchParams.set("focus",focus.join(","));
   const res=await baseWorker.fetch(new Request(u),paperEnv(env));
   if(!res.ok)throw new Error(`Tarama HTTP ${res.status}: ${(await res.text()).slice(0,180)}`);
@@ -179,6 +179,35 @@ async function updateFastWatch(env,data){
     });
     return res.ok?res.json():null;
   }catch{return null;}
+}
+
+async function getDiscoveryFocus(env){
+  try{
+    const res=await trackerStub(env).fetch("https://paper.local/v31-discovery-focus");
+    if(!res.ok)return [];
+    const j=await res.json();
+    return Array.isArray(j?.discovery)?j.discovery.slice(0,5):[];
+  }catch{return [];}
+}
+
+async function updateDiscoveryFocus(env,data){
+  try{
+    const candidates=(Array.isArray(data?.all)?data.all:[]).filter(x=>x?.discoveryCandidate);
+    const res=await trackerStub(env).fetch("https://paper.local/v31-discovery-focus",{
+      method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({candidates,scannedSymbols:data?.scannedSymbols||[],scannedAt:data?.scannedAt})
+    });
+    return res.ok?res.json():null;
+  }catch{return null;}
+}
+
+function mergeFocus(watch,discovery){
+  const out=[],seen=new Set();
+  for(const x of [...(Array.isArray(watch)?watch:[]),...(Array.isArray(discovery)?discovery:[])]){
+    const sym=String(x?.symbol||""); if(!sym||seen.has(sym))continue;
+    seen.add(sym);out.push(x); if(out.length>=10)break;
+  }
+  return out;
 }
 
 async function telegramSend(env,title,message){
@@ -250,13 +279,13 @@ function watchMessage(x){
 function paperSummaryHtml(paper){
   const s=paper?.stats||{};
   const trades=Array.isArray(paper?.trades)?paper.trades:[];
-  const fresh=trades.filter(t=>t.scannerVersion==="V3.0");
+  const fresh=trades.filter(t=>t.scannerVersion==="V3.1");
   const freshOpen=fresh.filter(t=>t.status==="OPEN");
   const freshClosed=fresh.filter(t=>t.status!=="OPEN");
   const freshWins=freshClosed.filter(t=>Number(t.realizedR)>0.0001).length;
   const freshWr=freshClosed.length?100*freshWins/freshClosed.length:0;
   const totalOpen=Number(s.open||0),totalClosed=Number(s.closed||0);
-  return `V3.0.2 YENİ: <b>${freshOpen.length} açık</b> · ${freshClosed.length} kapanan · Win %${freshWr.toFixed(1)} · <span class="muted">Geçmiş kayıt: ${totalOpen} açık / ${totalClosed} kapanan</span>`;
+  return `V3.1 YENİ: <b>${freshOpen.length} açık</b> · ${freshClosed.length} kapanan · Win %${freshWr.toFixed(1)} · <span class="muted">Geçmiş kayıt: ${totalOpen} açık / ${totalClosed} kapanan</span>`;
 }
 
 function openPaperHtml(paper){
@@ -264,7 +293,7 @@ function openPaperHtml(paper){
   if(!trades.length)return `<div class="muted">Açık paper işlem yok.</div>`;
   return trades.map(t=>{
     const usd=num(t.pnlUSDT), cls=usd>0?"good":usd<0?"bad":"muted";
-    const meta=t.scannerVersion==="V3.0"?` · Emre ${esc(t.emreScore??"-")}/10 · Aksel ${esc(t.akselScore??"-")}/10 · Belit ${esc(t.belitScore??"-")}/10 · Hybrid ${esc(t.executionScore??t.entryQuality??"-")}/10 · ${esc(publicStatusLabel(t.publicStatus||"WAIT"))}`:"";
+    const meta=t.scannerVersion==="V3.1"?` · Emre ${esc(t.emreScore??"-")}/10 · Aksel ${esc(t.akselScore??"-")}/10 · Belit ${esc(t.belitScore??"-")}/10 · Hybrid ${esc(t.executionScore??t.entryQuality??"-")}/10 · ${esc(publicStatusLabel(t.publicStatus||"WAIT"))}`:"";
     return `<div class="paperCard"><div class="row"><b>${esc(t.symbol)} · ${esc(t.direction)} · ${esc(t.score)}/10${meta}</b><span class="${cls}">${usd==null?"fiyat bekleniyor":`${usd>=0?"+":"-"}$${Math.abs(usd).toFixed(2)}`}</span></div><div>Giriş: ${esc(t.entry)} · Güncel: ${esc(t.currentPrice??"-")}</div><div>Margin: ${esc(t.paperMarginUSDT??"-")} USDT · ${esc(t.scoreBand??"-")} · ${esc(t.leverage??5)}x</div><div>SL: ${esc(t.stop)} · TP1: ${esc(t.tp1)} ${t.tp1Hit?"✅":""} · TP2: ${esc(t.tp2)} ${t.tp2Hit?"✅":""}</div></div>`;
   }).join("");
 }
@@ -272,11 +301,11 @@ function openPaperHtml(paper){
 function scanCards(data){
   return (data.all||[]).map(x=>{
     if(x.error)return `<div class="card"><b>${esc(x.symbol)}</b><div class="bad">${esc(x.error)}</div></div>`;
-    const ok=Boolean(x.v300Qualifies),watch=Boolean(x.hybridWatchCandidate);
-    const status=publicStatusLabel(x.publicStatus||"WAIT");
-    const cls=ok?"good":watch?"warn":x.publicStatus==="MISSED"?"bad":"muted";
+    const ok=Boolean(x.v300Qualifies),watch=Boolean(x.hybridWatchCandidate),discovery=Boolean(x.discoveryCandidate);
+    const status=ok?publicStatusLabel(x.publicStatus||"WAIT"):watch?publicStatusLabel(x.publicStatus||"WAIT"):discovery?"DISCOVERY":publicStatusLabel(x.publicStatus||"WAIT");
+    const cls=ok?"good":watch||discovery?"warn":x.publicStatus==="MISSED"?"bad":"muted";
     const exec=x.hybridExecutionScore==null?"—":`${esc(x.hybridExecutionScore)}/10`;
-    return `<div class="card"><div class="row"><b>${esc(x.symbol)} ${x.isCore5?"· CORE5":"· GENİŞ"}</b><span class="${cls}">${esc(status)}</span></div><div><b>Hybrid Setup ${esc(x.hybridSetupScore??x.setupQuality??"-")}/10 · Execution ${exec}</b></div><div>Emre <b>${esc(x.emreScore??"-")}</b> · Aksel <b>${esc(x.akselScore??"-")}</b> · Belit <b>${esc(x.belitScore??"-")}</b> · Klasik ${esc(x.score??"-")}</div><div>Pattern <b>${esc(x.patternType??"-")}</b> · Fib ${esc(x.emreFibLabel??"-")} · retrace ${esc(x.emreFibRetracement??"-")}</div><div>Yatay sınır ${esc(x.boundary??"-")} · test ${esc(x.boundaryTests??0)} (${esc(x.boundaryTestQuality??"-")}) · Flag sınır ${esc(x.flagBoundary??"-")} · ${esc(x.flagDistanceATR??"-")} ATR</div><div>1G SMA ${esc(x.smaDaily??"-")} · ADR20 %${esc(x.adr20Pct??"-")} · 4s/1s/15dk ${esc(x.trend4h)}/${esc(x.trend1h)}/${esc(x.trend15m)} · RSI4s ${esc(x.rsi4h??"-")} · Hacim ${esc(x.volumeRatio??"-")}x</div><div>Last ${esc(x.lastPrice??"-")} · Mark ${esc(x.markPrice??"-")} · Giriş ${esc(x.entry)} · SL ${esc(x.stop??"-")} · TP1 ${esc(x.tp1??"-")} · TP2 ${esc(x.tp2??"-")}</div><small>${ok?"V3.0 ÜÇLÜ KONSENSÜS PAPER GİR":watch?"Konsensüs hazırlığı var; tetik bekleniyor":"Üçlü konsensüs / tetik şartları tamamlanmadı"}</small></div>`;
+    return `<div class="card"><div class="row"><b>${esc(x.symbol)} ${x.isCore5?"· CORE5":"· GENİŞ"}</b><span class="${cls}">${esc(status)}</span></div><div><b>Hybrid Setup ${esc(x.hybridSetupScore??x.setupQuality??"-")}/10 · Execution ${exec}</b></div><div>Emre <b>${esc(x.emreScore??"-")}</b> · Aksel <b>${esc(x.akselScore??"-")}</b> · Belit <b>${esc(x.belitScore??"-")}</b> · Klasik ${esc(x.score??"-")}</div><div>Pattern <b>${esc(x.patternType??"-")}</b> · Fib ${esc(x.emreFibLabel??"-")} · retrace ${esc(x.emreFibRetracement??"-")}</div><div>Yatay sınır ${esc(x.boundary??"-")} · test ${esc(x.boundaryTests??0)} (${esc(x.boundaryTestQuality??"-")}) · Flag sınır ${esc(x.flagBoundary??"-")} · ${esc(x.flagDistanceATR??"-")} ATR</div><div>1G SMA ${esc(x.smaDaily??"-")} · ADR20 %${esc(x.adr20Pct??"-")} · 4s/1s/15dk ${esc(x.trend4h)}/${esc(x.trend1h)}/${esc(x.trend15m)} · RSI4s ${esc(x.rsi4h??"-")} · Hacim ${esc(x.volumeRatio??"-")}x</div><div>Last ${esc(x.lastPrice??"-")} · Mark ${esc(x.markPrice??"-")} · Giriş ${esc(x.entry)} · SL ${esc(x.stop??"-")} · TP1 ${esc(x.tp1??"-")} · TP2 ${esc(x.tp2??"-")}</div><small>${ok?"V3.1 ÜÇLÜ KONSENSÜS PAPER GİR":watch?"Konsensüs hazırlığı var; tetik bekleniyor":discovery?`PRE-BREAKOUT DISCOVERY ${esc(x.discoveryDirection??"")} · skor ${esc(x.discoveryScore??"-")}/10 · sınır ${esc(x.discoveryBoundary??"-")}`:"Üçlü konsensüs / tetik şartları tamamlanmadı"}</small></div>`;
   }).join("");
 }
 
@@ -286,9 +315,15 @@ function watchHtml(data){
   return w.map(x=>`<div class="paperCard"><b>${esc(x.symbol)} · ${esc(publicStatusLabel(x.publicStatus))} · Hybrid ${esc(x.hybridSetupScore??x.setupQuality)}/10</b><div>Emre ${esc(x.emreScore??"-")} · Aksel ${esc(x.akselScore??"-")} · Belit ${esc(x.belitScore??"-")} · ${esc(x.patternType??"-")}</div><div>Yatay ${esc(x.boundary??"-")} · Flag ${esc(x.flagBoundary??"-")} · ŞİMDİ GİRİŞ YOK</div></div>`).join("");
 }
 
+function discoveryHtml(data){
+  const d=Array.isArray(data.discovery)?data.discovery:[];
+  if(!d.length)return `<div class="muted">Bu turda 6.5/10+ PRE-BREAKOUT DISCOVERY adayı yok.</div>`;
+  return d.map(x=>`<div class="paperCard"><b>${esc(x.symbol)} · ${esc(x.discoveryDirection??"-")} · Discovery ${esc(x.discoveryScore??"-")}/10</b><div>Sınır ${esc(x.discoveryBoundary??"-")} · ${esc(x.discoveryBoundaryTests??0)} test · mesafe %${esc(x.discoveryDistancePct??"-")}</div><div>Base ${esc(x.discoveryBaseSpanDays??"-")}g · staircase ${x.discoveryStaircase?"EVET":"—"} · sıkışma ${x.discoveryCompression?"EVET":"—"} · squeeze ${x.discoverySqueeze?"EVET":"—"} · SMA ${esc(x.discoverySma??"-")}</div><small>DISCOVERY = işlem değil. Hacim tetik şartı aranmaz; aday hızlı takibe alınır. HAZIR/ARMED ve PAPER GİR ayrı teyit ister.</small></div>`).join("");
+}
+
 function page(data,paper,migration){
   const archived=Number(migration?.archivedTrades||0);
-  return `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>BingX Paper Bot V3.0.1 Hybrid Consensus</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:860px;margin:auto;padding:18px;background:#0b0d10;color:#f4f4f5}.card,.paperWrap{background:#171a1f;border:1px solid #2a2f37;border-radius:14px;padding:14px;margin:10px 0;line-height:1.55}.paperWrap{background:#111419}.paperCard{padding:10px 0;border-bottom:1px solid #2a2f37}.paperCard:last-child{border-bottom:0}.row{display:flex;justify-content:space-between;gap:12px}.good{color:#4ade80}.warn{color:#facc15}.bad{color:#fb7185}.muted,small{color:#a1a1aa}.notifyBtn{margin:10px 6px 4px 0;padding:10px 14px;border:0;border-radius:10px;font-weight:700}</style><div class="head"><h2>BingX Paper Bot · Top100 V3.0.1 · Emre + Aksel + Belit Consensus</h2><div><b>PAPER/TEST ONLY</b> · EXECUTION_MODE zorla TEST · BTC ${esc(data.btcDirection)}</div><div><b>Emre katmanı:</b> 4s+1s HTF yön · 1G SMA rejimi · 4s RSI · objektif impuls/Fibonacci retracement · invalidation</div><div><b>Aksel katmanı:</b> yatay boundary/test + 4s flag/channel · kapanışla kırılım/retest · pattern invalidation · giriş güncelliği</div><div><b>Belit katmanı:</b> SMA10/20/50/100/200 · sıkışma · hacim/baskı · ADR/ATR · 15dk tetik · KAÇTI/KOVALAMA</div><div><b>PAPER GİR:</b> üçlü konsensüs + Hybrid Execution ≥7.5 · Emre ≥6 · Aksel ≥6.5 · Belit ≥6.25 · Last/Mark geçerli · risk/hedef geçerli</div><div>5x isolated · margin 7.5–7.9 = 5–7 USDT · 8.0–8.5 = 10 · 9+ = 15 · max 5 açık · aynı yön max 3 · en iyi 1–2 tetik</div><div>İlk 10 likit + CORE5 her dakika · en iyi 5 watch hızlı takip · Top100 ~10 dk tam tur · Telegram yalnız PAPER GİR</div><div>${paperSummaryHtml(paper)}</div><div class="muted">Geçmiş V2.x paper kayıtları korunur; V3.0.2 ayrı yeni örneklem olarak sayılır. Elliott dalga sayımı otomatik ve öznel olduğu için V3.0 Emre katmanında yalnız objektif HTF/Fib/momentum bileşenleri kullanılır.</div><button class="notifyBtn" onclick="testNotify(this)">BİLDİRİM TESTİ</button><button class="notifyBtn" onclick="testBingx(this)">BINGX BAĞLANTI TESTİ</button><div>Top100 likit evren · Dilim ${esc(data.shard)}/${esc(data.shardCount)} · Bu tur ${(data.all||[]).length} coin · PAPER GİR ${(data.signals||[]).length} · HAZIR/ARMED ${(data.watch||[]).length}</div><small>Son tarama ${esc(data.scannedAt)}</small></div><div class="paperWrap"><b>ÜÇLÜ KONSENSÜS RADARI</b>${watchHtml(data)}</div><div class="paperWrap"><b>AÇIK AUTO PAPER POZİSYONLARI</b>${openPaperHtml(paper)}</div>${scanCards(data)}<script>async function testNotify(btn){const old=btn.textContent;btn.disabled=true;btn.textContent="Gönderiliyor...";try{const r=await fetch('/notify-test',{method:'POST'});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'hata');alert('Test bildirimi gönderildi');}catch(e){alert('Bildirim testi başarısız: '+e.message);}finally{btn.disabled=false;btn.textContent=old;}}async function testBingx(btn){if(!confirm('BingX API ve TEST emir yolunu kontrol edelim mi? Gerçek pozisyon açılmaz.'))return;const old=btn.textContent;btn.disabled=true;btn.textContent='Kontrol ediliyor...';try{const r=await fetch('/bingx-connection-test',{method:'POST'});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'hata');alert('BINGX TEST BAŞARILI — gerçek pozisyon açılmadı.');}catch(e){alert('BingX testi başarısız: '+e.message);}finally{btn.disabled=false;btn.textContent=old;}}</script>`;
+  return `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>BingX Paper Bot V3.1 Wide Discovery</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:860px;margin:auto;padding:18px;background:#0b0d10;color:#f4f4f5}.card,.paperWrap{background:#171a1f;border:1px solid #2a2f37;border-radius:14px;padding:14px;margin:10px 0;line-height:1.55}.paperWrap{background:#111419}.paperCard{padding:10px 0;border-bottom:1px solid #2a2f37}.paperCard:last-child{border-bottom:0}.row{display:flex;justify-content:space-between;gap:12px}.good{color:#4ade80}.warn{color:#facc15}.bad{color:#fb7185}.muted,small{color:#a1a1aa}.notifyBtn{margin:10px 6px 4px 0;padding:10px 14px;border:0;border-radius:10px;font-weight:700}</style><div class="head"><h2>BingX Paper Bot · V3.1 · Wide Discovery + Emre + Aksel + Belit</h2><div><b>PAPER/TEST ONLY</b> · EXECUTION_MODE zorla TEST · BTC ${esc(data.btcDirection)}</div><div><b>Emre katmanı:</b> 4s+1s HTF yön · 1G SMA rejimi · 4s RSI · objektif impuls/Fibonacci retracement · invalidation</div><div><b>Aksel katmanı:</b> yatay boundary/test + 4s flag/channel · kapanışla kırılım/retest · pattern invalidation · giriş güncelliği</div><div><b>Belit katmanı:</b> SMA10/20/50/100/200 · sıkışma · hacim/baskı · ADR/ATR · 15dk tetik · KAÇTI/KOVALAMA</div><div><b>PAPER GİR:</b> üçlü konsensüs + Hybrid Execution ≥7.5 · Emre ≥6 · Aksel ≥6.5 · Belit ≥6.25 · Last/Mark geçerli · risk/hedef geçerli</div><div>5x isolated · margin 7.5–7.9 = 5–7 USDT · 8.0–8.5 = 10 · 9+ = 15 · max 5 açık · aynı yön max 3 · en iyi 1–2 tetik</div><div>İlk 10 likit + CORE5 her dakika · en iyi 5 HAZIR/ARMED + en iyi 5 DISCOVERY hızlı takip · Top100 hard cutoff YOK · yeterli likiditeli BingX perpetual geniş evren dönüşümlü tarama · Telegram yalnız PAPER GİR</div><div>${paperSummaryHtml(paper)}</div><div class="muted">Geçmiş V2.x/V3.0 paper kayıtları korunur; V3.1 ayrı yeni örneklem olarak sayılır. DISCOVERY trade değildir; yalnız base + higher-low/lower-high + boundary + SMA dönüşü/sıkışma adaylarını erken bulur. Elliott dalga sayımı otomatik kullanılmaz.</div><button class="notifyBtn" onclick="testNotify(this)">BİLDİRİM TESTİ</button><button class="notifyBtn" onclick="testBingx(this)">BINGX BAĞLANTI TESTİ</button><div>Geniş likit evren ${esc(data.universeCount??"-")} coin · Dilim ${esc(data.shard)}/${esc(data.shardCount)} (~${esc(data.estimatedFullCycleMin??data.shardCount)} dk tam tur) · Bu tur ${(data.all||[]).length} coin · DISCOVERY ${(data.discovery||[]).length} · HAZIR/ARMED ${(data.watch||[]).length} · PAPER GİR ${(data.signals||[]).length}</div><small>Son tarama ${esc(data.scannedAt)}</small></div><div class="paperWrap"><b>PRE-BREAKOUT DISCOVERY RADARI</b>${discoveryHtml(data)}</div><div class="paperWrap"><b>ÜÇLÜ KONSENSÜS RADARI</b>${watchHtml(data)}</div><div class="paperWrap"><b>AÇIK AUTO PAPER POZİSYONLARI</b>${openPaperHtml(paper)}</div>${scanCards(data)}<script>async function testNotify(btn){const old=btn.textContent;btn.disabled=true;btn.textContent="Gönderiliyor...";try{const r=await fetch('/notify-test',{method:'POST'});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'hata');alert('Test bildirimi gönderildi');}catch(e){alert('Bildirim testi başarısız: '+e.message);}finally{btn.disabled=false;btn.textContent=old;}}async function testBingx(btn){if(!confirm('BingX API ve TEST emir yolunu kontrol edelim mi? Gerçek pozisyon açılmaz.'))return;const old=btn.textContent;btn.disabled=true;btn.textContent='Kontrol ediliyor...';try{const r=await fetch('/bingx-connection-test',{method:'POST'});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'hata');alert('BINGX TEST BAŞARILI — gerçek pozisyon açılmadı.');}catch(e){alert('BingX testi başarısız: '+e.message);}finally{btn.disabled=false;btn.textContent=old;}}</script>`;
 }
 
 export class PaperTracker extends BasePaperTracker {
@@ -300,7 +335,7 @@ export class PaperTracker extends BasePaperTracker {
     const archive={version:"V2.x",archivedAt,trades:oldTrades};
     await this.state.storage.put("archive_v218",archive);
     await this.state.storage.put("trades",[]);
-    const m={version:"V3.0.2",archivedAt,archivedTrades:oldTrades.length};
+    const m={version:"V3.1",archivedAt,archivedTrades:oldTrades.length};
     await this.state.storage.put("v219_migrated",m);
     await this.state.storage.put("v219_alerts",{});
     await this.state.storage.put("v220_watch_alerts",{});
@@ -327,7 +362,7 @@ export class PaperTracker extends BasePaperTracker {
       if(before.has(t.id))continue;
       const s=selected.find(x=>x.symbol===t.symbol&&x.direction===t.direction);
       if(!s)continue;
-      t.scannerVersion="V3.0.2";
+      t.scannerVersion="V3.1";
       t.setupQuality=Number(s.setupQuality||0);
       t.entryQuality=Number(s.entryQuality||0);
       t.triggerReadiness=Number(s.triggerReadiness||s.entryQuality||0);
@@ -397,6 +432,24 @@ export class PaperTracker extends BasePaperTracker {
       await this.state.storage.put("v223_fast_watch",state);
       return Response.json({ok:true,watch});
     }
+    if(url.pathname==="/v31-discovery-focus"){
+      const now=Date.now(),ttl=8*60*60*1000;
+      let state=(await this.state.storage.get("v31_discovery_focus"))||{};
+      for(const [sym,v] of Object.entries(state))if(now-Number(v?.updatedAt||0)>ttl)delete state[sym];
+      if(request.method==="POST"){
+        const body=await request.json().catch(()=>({}));
+        const scanned=new Set((Array.isArray(body?.scannedSymbols)?body.scannedSymbols:[]).map(String));
+        const candidates=Array.isArray(body?.candidates)?body.candidates:[];
+        const candidateMap=new Map(candidates.filter(x=>x?.symbol&&x?.discoveryCandidate).map(x=>[String(x.symbol),x]));
+        for(const sym of scanned)if(!candidateMap.has(sym))delete state[sym];
+        for(const x of candidateMap.values())state[String(x.symbol)]={symbol:String(x.symbol),direction:x.discoveryDirection,discoveryScore:Number(x.discoveryScore||0),boundary:x.discoveryBoundary,distancePct:x.discoveryDistancePct,updatedAt:Date.parse(body?.scannedAt)||now};
+      }
+      const discovery=Object.values(state).sort((a,b)=>(Number(b.discoveryScore)||0)-(Number(a.discoveryScore)||0)||Math.abs(Number(a.distancePct)||99)-Math.abs(Number(b.distancePct)||99)).slice(0,5);
+      const keep=new Set(discovery.map(x=>x.symbol));
+      state=Object.fromEntries(Object.entries(state).filter(([k])=>keep.has(k)));
+      await this.state.storage.put("v31_discovery_focus",state);
+      return Response.json({ok:true,discovery});
+    }
     if(url.pathname==="/v220-claim-watch"){
       const body=await request.json().catch(()=>({}));
       const now=Date.parse(body?.scannedAt)||Date.now();
@@ -421,12 +474,13 @@ export default {
     const url=new URL(request.url);
     if(url.pathname==="/notify-test"){
       if(request.method!=="POST")return new Response("Method Not Allowed",{status:405});
-      try{const channel=await sendPrimary(env,"BingX BİLDİRİM TESTİ · V3.0.2","Bildirim kanalı çalışıyor. V3.0.2 Emre+Aksel+Belit üçlü konsensüs aktiftir. Telegram yalnız PAPER GİR LONG/SHORT sinyallerini gönderir. Worker EXECUTION_MODE zorla TEST kilitlidir; gerçek emir açılamaz.");return Response.json({ok:true,channel},{headers:{"cache-control":"no-store"}});}catch(e){return Response.json({ok:false,error:String(e?.message||e)},{status:500});}
+      try{const channel=await sendPrimary(env,"BingX BİLDİRİM TESTİ · V3.1","Bildirim kanalı çalışıyor. V3.1 Wide Discovery + Emre+Aksel+Belit üçlü konsensüs aktiftir. Telegram yalnız PAPER GİR LONG/SHORT sinyallerini gönderir. Worker EXECUTION_MODE zorla TEST kilitlidir; gerçek emir açılamaz.");return Response.json({ok:true,channel},{headers:{"cache-control":"no-store"}});}catch(e){return Response.json({ok:false,error:String(e?.message||e)},{status:500});}
     }
     if(url.pathname==="/json"){
       try{
-        const focus=await getFastWatch(env);
-        const data=await scanThroughBase(env,(Array.isArray(focus)?focus:[]).map(x=>x?.symbol).filter(Boolean));
+        const [watchFocus,discoveryFocus]=await Promise.all([getFastWatch(env),getDiscoveryFocus(env)]);
+        const focus=mergeFocus(watchFocus,discoveryFocus);
+        const data=await scanThroughBase(env,focus.map(x=>x?.symbol).filter(Boolean));
         return Response.json(data,{headers:{"cache-control":"no-store"}});
       }catch(e){const info=errInfo("JSON_SCAN",e);return Response.json({ok:false,error:info.message,stage:info.stage,stack:info.stack},{status:500,headers:{"cache-control":"no-store"}});}
     }
@@ -437,14 +491,14 @@ export default {
 
     if(url.pathname==="/"||url.pathname===""){
       let focus=[],data=null,paper=null,migration={},scanError=null,paperError=null;
-      try{focus=await getFastWatch(env);}catch(e){errInfo("FAST_WATCH",e);focus=[];}
+      try{const [watchFocus,discoveryFocus]=await Promise.all([getFastWatch(env),getDiscoveryFocus(env)]);focus=mergeFocus(watchFocus,discoveryFocus);}catch(e){errInfo("FAST_FOCUS",e);focus=[];}
       try{data=await scanThroughBase(env,(Array.isArray(focus)?focus:[]).map(x=>x?.symbol).filter(Boolean));}
       catch(e){scanError=errInfo("SCAN",e);}
       try{paper=await paperSnapshot(env);}catch(e){paperError=errInfo("PAPER_STATS",e);paper=emptyPaper(String(e?.message||e));}
       try{const migRes=await trackerStub(env).fetch("https://paper.local/v219-migration");migration=migRes.ok?await migRes.json():{};}catch(e){errInfo("MIGRATION",e);migration={};}
       if(!data){
         const detail=scanError?.stack?`<div style="margin-top:12px;color:#666;font-size:13px">Aşama: ${esc(scanError.stage)} · ${esc(scanError.stack)}</div>`:"";
-        return new Response(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:24px"><h2>BingX Paper Bot · V3.0.2</h2><p><b>Tarama geçici olarak durdu.</b> PAPER/TEST kilidi aktif; gerçek emir açılamaz.</p><p>Hata aşaması: <b>${esc(scanError?.stage||"SCAN")}</b><br>${esc(scanError?.message||"bilinmeyen hata")}</p>${detail}<p>Paper istatistik katmanı: ${paperError?"hata":"çalışıyor"}</p></body>`,{status:500,headers:{"content-type":"text/html; charset=UTF-8","cache-control":"no-store"}});
+        return new Response(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:24px"><h2>BingX Paper Bot · V3.1</h2><p><b>Tarama geçici olarak durdu.</b> PAPER/TEST kilidi aktif; gerçek emir açılamaz.</p><p>Hata aşaması: <b>${esc(scanError?.stage||"SCAN")}</b><br>${esc(scanError?.message||"bilinmeyen hata")}</p>${detail}<p>Paper istatistik katmanı: ${paperError?"hata":"çalışıyor"}</p></body>`,{status:500,headers:{"content-type":"text/html; charset=UTF-8","cache-control":"no-store"}});
       }
       return new Response(page(data,paper||emptyPaper(),migration),{headers:{"content-type":"text/html; charset=UTF-8","cache-control":"no-store"}});
     }
@@ -454,17 +508,18 @@ export default {
   },
 
   async scheduled(controller,env,ctx){
-    const focus=await getFastWatch(env).catch(()=>[]);
+    const [watchFocus,discoveryFocus]=await Promise.all([getFastWatch(env).catch(()=>[]),getDiscoveryFocus(env).catch(()=>[])]);
+    const focus=mergeFocus(watchFocus,discoveryFocus);
     let data;
-    try{data=await scanThroughBase(env,(Array.isArray(focus)?focus:[]).map(x=>x?.symbol).filter(Boolean));}
+    try{data=await scanThroughBase(env,focus.map(x=>x?.symbol).filter(Boolean));}
     catch(e){errInfo("CRON_SCAN",e);return;}
     const paper=await paperTick(env,data).catch(e=>{errInfo("CRON_PAPER",e);return {stats:null};});
-    const fastWatch=await updateFastWatch(env,data);
+    const [fastWatch,fastDiscovery]=await Promise.all([updateFastWatch(env,data),updateDiscoveryFocus(env,data)]);
     // Telegram is intentionally signal-only in V3.0.
     // HAZIRLANIYOR / ARMED / other early-warning candidates remain visible on the web radar,
     // but they are not claimed or pushed to Telegram.
     const alerts=await claimAlerts(env,data.signals||[],data.scannedAt);
-    console.log(JSON.stringify({cron:controller.cron,version:"V3.0.2",scannedAt:data.scannedAt,shard:data.shard,scanned:data.all?.length||0,qualified:data.signals?.length||0,watch:data.watch?.length||0,fastWatch:(fastWatch?.watch||focus).map(x=>x.symbol),alerts:alerts.length,telegramWatchAlerts:0,paper:paper?.stats||null}));
+    console.log(JSON.stringify({cron:controller.cron,version:"V3.1",scannedAt:data.scannedAt,shard:data.shard,scanned:data.all?.length||0,qualified:data.signals?.length||0,watch:data.watch?.length||0,discovery:data.discovery?.length||0,fastWatch:(fastWatch?.watch||watchFocus).map(x=>x.symbol),fastDiscovery:(fastDiscovery?.discovery||discoveryFocus).map(x=>x.symbol),alerts:alerts.length,telegramWatchAlerts:0,paper:paper?.stats||null}));
     if(alerts.length){
       ctx.waitUntil((async()=>{
         for(const x of alerts){

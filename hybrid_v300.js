@@ -166,5 +166,5 @@ export async function enrichHybridData(raw){
   const signals=all.filter(isV300Signal).sort((a,b)=>(Number(b.hybridExecutionScore)||0)-(Number(a.hybridExecutionScore)||0)||(Number(b.hybridSetupScore)||0)-(Number(a.hybridSetupScore)||0)).slice(0,CFG.maxSignals);
   const ss=new Set(signals.map(x=>x.symbol));
   const watch=all.filter(x=>x.hybridWatchCandidate&&!ss.has(x.symbol)).sort((a,b)=>(b.publicStatus==="ARMED")-(a.publicStatus==="ARMED")||(Number(b.hybridSetupScore)||0)-(Number(a.hybridSetupScore)||0)).slice(0,CFG.maxWatch);
-  return {...b,version:"TOP100_V3_0_HYBRID",signals,watch,all};
+  return {...b,version:"BINGX_WIDE_V3_1_HYBRID",signals,watch,all};
 }

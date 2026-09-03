@@ -1,32 +1,39 @@
-V3.0.2 HARDENED HOTFIX
+V3.1 WIDE DISCOVERY + EMRE + AKSEL + BELIT CONSENSUS
 
-V3.0.1 HOTFIX: Coin bazlı hata izolasyonu eklendi;  Yönü henüz oluşmamış coinlerde hybridReasons oluşturulurken undefined.slice hatası engellendi. Tek bir eksik veri satırı artık taramanın tamamını düşürmez. V3.0 paper örneklemi korunur.
+PAPER/TEST ONLY. Worker, EXECUTION_MODE değerini zorla TEST yapar. Kullanıcı açıkça “gerçek paraya geçiyoruz” demeden gerçek emir açılamaz.
 
-BingX Paper Bot V3.0 — Emre + Aksel + Belit Consensus
+NEDEN V3.1?
+- Top100 hard cutoff kaldırıldı. Bot artık BingX USDⓢ-M perpetual evreninde 24s quote volume >= 1.5M USDT olan pariteleri aday havuzuna alır.
+- Ticker bid/ask alanları mevcutsa spread > %0.45 olanlar daha baştan elenir.
+- En likit 10 + CORE5 her dakika; en iyi 5 HAZIR/ARMED + en iyi 5 PRE-BREAKOUT DISCOVERY her dakika hızlı takip edilir.
+- Geri kalan yeterli likiditeli evren 12 coinlik rotating shard ile taranır. Tam tur süresi gerçek universe sayısına göre panelde dinamik gösterilir.
 
-PAPER/TEST ONLY. worker env EXECUTION_MODE zorla TEST'e çevrilir.
+PRE-BREAKOUT DISCOVERY (TRADE DEĞİLDİR)
+Amaç Belit EDU/UNI benzeri yapıları patlamadan önce bulmak:
+- 2+ testli yatay direnç/destek
+- sınırın yaklaşık %8 içinde olma
+- higher-low (LONG) / lower-high (SHORT) merdiveni
+- günlük compression / directional squeeze
+- SMA rejiminin toparlanması
+- base/boundary olgunluğu
+- 4s+1s ikisi birden net ters yöndeyse discovery reddedilir
+- Hacim discovery için zorunlu DEĞİL; yalnız küçük bonus. Hacim/momentum ağırlığı HAZIR/ARMED ve PAPER GİR aşamasında artar.
+- En iyi 5 discovery web panelinde görünür ve hızlı takibe alınır. Telegram'a discovery mesajı gönderilmez.
 
-Karar mimarisi:
-1) Emre katmanı (rejim/harita): 4s+1s HTF trend, 1G SMA rejimi, 4s RSI, objektif impuls + Fibonacci retracement, HTF/Fib invalidation.
-2) Aksel/TechCharts katmanı (yapı): yatay boundary/test kalitesi veya 4s flag/channel; kapanışla breakout/retest; pattern invalidation; giriş güncelliği.
-3) Belit katmanı (execution): SMA10/20/50/100/200, sıkışma, hacim/order-flow, ADR/ATR, 15dk hızlı tetik, uzama/KAÇTI filtresi.
+İŞLEM ZİNCİRİ
+DISCOVERY -> HAZIRLANIYOR/ARMED -> gerçek 15dk/yatay/flag tetik -> Emre+Aksel+Belit konsensüsü -> PAPER GİR
 
-PAPER GİR için:
+PAPER GİR aynı sıkılıkta kalır:
 - Hybrid Execution >= 7.5
 - Emre >= 6.0
 - Aksel >= 6.5
 - Belit >= 6.25
-- gerçek tetik (yatay breakout/retest veya flag/channel breakout/retest)
+- gerçek breakout/retest tetik
 - Last/Mark giriş geçerliliği
 - funding filtresi
 - riskOk + rangeOk
-- uzamış hareket yok
+- uzamış/kaçmış hareket yok
 
-Not: Elliott Wave sayımı doğası gereği öznel olduğundan otomatik V3.0 motorunda doğrudan dalga numarası üretmez. Emre yaklaşımının otomasyona uygun objektif parçaları (HTF, Fib, RSI/momentum, invalidation) kullanılır.
-
-Tarama:
-- İlk 10 likit + CORE5 her dakika
-- En iyi 5 HAZIR/ARMED her dakika hızlı takip
-- Top100 yaklaşık 10 dakikada tam tur
-- Telegram yalnız PAPER GİR
-- Margin: 7.5–7.9 = 5–7 USDT; 8.0–8.5 = 10; 9+ = 15; 5x
+Margin: 7.5–7.9 = 5–7 USDT; 8.0–8.5 = 10; 9+ = 15; 5x.
+Telegram yalnız PAPER GİR LONG/SHORT sinyallerini gönderir.
+V3.1 işlemleri önceki V2.x/V3.0 kayıtlarından ayrı yeni örneklem olarak sayılır.

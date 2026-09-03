@@ -1,13 +1,15 @@
 const CORE5 = ["BTC-USDT","ETH-USDT","SOL-USDT","XRP-USDT","DOGE-USDT"];
 const FAST_LIQUID_COUNT = 10;
+const MIN_QUOTE_VOLUME_USDT = 1_500_000;
+const MAX_TICKER_SPREAD_PCT = 0.45;
 
 const CFG = {
   minScore: 7,
   leverage: 5,
   paperBalance: 200,
   maxMarginPct: 0.10,
-  universeSize: 100,
-  shardSize: 10,
+  universeSize: 600, // hard rank cutoff yok; yalnız güvenlik üst sınırı
+  shardSize: 12,
   minTP2MovePct: 2.0,
   maxStopPct: 4.0,
   tp1ClosePct: 25,
@@ -166,14 +168,27 @@ async function getKlines(symbol, interval, limit) {
   return rows;
 }
 
-async function getTopSymbols(limit = CFG.universeSize) {
+function syntheticTickerSymbol(symbol){
+  const s=String(symbol||"").toUpperCase();
+  return /(?:NCCO|BRENT|WTI|OIL|XAU|XAG|GOLD|SILVER|NASDAQ|SP500|DOW|DJI|FOREX)/.test(s);
+}
+
+async function getUniverseSymbols(limit = CFG.universeSize) {
   const u = new URL("https://open-api.bingx.com/openApi/swap/v2/quote/ticker");
   const json = await bingxJson(u);
   const rows = Array.isArray(json?.data) ? json.data : [];
   return rows
-    .filter(x => typeof x?.symbol === "string" && x.symbol.endsWith("-USDT"))
-    .map(x => ({symbol:x.symbol, quoteVolume:Number(x.quoteVolume||0), lastPrice:Number(x.lastPrice||0)}))
-    .filter(x => Number.isFinite(x.quoteVolume) && x.quoteVolume>0 && Number.isFinite(x.lastPrice) && x.lastPrice>0)
+    .filter(x => typeof x?.symbol === "string" && x.symbol.endsWith("-USDT") && !syntheticTickerSymbol(x.symbol))
+    .map(x => {
+      const bid=Number(x.bidPrice ?? x.bid ?? x.bestBidPrice);
+      const ask=Number(x.askPrice ?? x.ask ?? x.bestAskPrice);
+      const last=Number(x.lastPrice||0), qv=Number(x.quoteVolume||0);
+      const mid=bid>0&&ask>0?(bid+ask)/2:null;
+      const spreadPct=mid?((ask-bid)/mid)*100:null;
+      return {symbol:x.symbol,quoteVolume:qv,lastPrice:last,spreadPct:Number.isFinite(spreadPct)?spreadPct:null};
+    })
+    .filter(x => Number.isFinite(x.quoteVolume) && x.quoteVolume>=MIN_QUOTE_VOLUME_USDT && Number.isFinite(x.lastPrice) && x.lastPrice>0)
+    .filter(x => x.spreadPct==null || x.spreadPct<=MAX_TICKER_SPREAD_PCT)
     .sort((a,b)=>b.quoteVolume-a.quoteVolume).slice(0,limit);
 }
 
@@ -392,7 +407,7 @@ function shardIndexFor(shardCount,date=new Date()){
 async function scan(extraSymbols=[]){
   extraSymbols=asArray(extraSymbols);
   const [top,premiumMap,btc4h,btc1h,btc15]=await Promise.all([
-    getTopSymbols(CFG.universeSize),
+    getUniverseSymbols(CFG.universeSize),
     getPremiumIndexMap(),
     getKlines("BTC-USDT","4h",220),
     getKlines("BTC-USDT","1h",120),
@@ -410,8 +425,8 @@ async function scan(extraSymbols=[]){
   const coreSet=new Set(CORE5);
   const fastLiquidItems=topSafe.slice(0,FAST_LIQUID_COUNT);
   const selectedMap=new Map();
-  // Her dakika: en likit 10 + CORE5 garantisi + en iyi 5 armed/watch.
-  // Ayrıca rotating shard sayesinde Top100'ün tamamı yaklaşık 10 dakikada bir yeniden görülür.
+  // Her dakika: en likit 10 + CORE5 garantisi + hızlı watch/discovery focus.
+  // Geri kalan yeterli likiditeli BingX perpetual evreni rotating shard ile taranır.
   for(const item of [...fastLiquidItems,...topSafe.filter(x=>coreSet.has(x.symbol)),...topSafe.filter(x=>focusSet.has(x.symbol)),...shardItems])if(item?.symbol)selectedMap.set(item.symbol,item);
   const selected=[...selectedMap.values()],results=[];
 
@@ -435,8 +450,8 @@ async function scan(extraSymbols=[]){
   }
 
   return {
-    mode:"PAPER_SCAN",version:"TOP100_V3_0_HYBRID",scannedAt:new Date().toISOString(),btcDirection:btcDir,minScore:CFG.minScore,
-    universe:`BingX top ${top.length} USDT perpetual by 24h quote volume`,shard:shardIndex+1,shardCount,
+    mode:"PAPER_SCAN",version:"BINGX_WIDE_V3_1",scannedAt:new Date().toISOString(),btcDirection:btcDir,minScore:CFG.minScore,
+    universe:`BingX ${top.length} likit USDT perpetual · min 24s hacim $${MIN_QUOTE_VOLUME_USDT.toLocaleString()}${MAX_TICKER_SPREAD_PCT?` · spread ≤%${MAX_TICKER_SPREAD_PCT}`:""}`,universeCount:top.length,universeMinQuoteVolumeUSDT:MIN_QUOTE_VOLUME_USDT,maxTickerSpreadPct:MAX_TICKER_SPREAD_PCT,shard:shardIndex+1,shardCount,estimatedFullCycleMin:shardCount,
     scannedSymbols:selected.map(x=>x.symbol),focusSymbols:[...focusSet],coreFastSymbols:CORE5.filter(s=>selectedMap.has(s)),fastLiquidSymbols:fastLiquidItems.map(x=>x.symbol),paperBalanceUSDT:CFG.paperBalance,
     signals:results.filter(x=>x.qualifies).sort((a,b)=>b.score-a.score),
     all:results.sort((a,b)=>(b.score||0)-(a.score||0)),
@@ -1678,7 +1693,7 @@ export default {
       }
     }
     try{
-      const focus=(url.searchParams.get("focus")||"").split(",").map(x=>x.trim()).filter(Boolean).slice(0,5);
+      const focus=(url.searchParams.get("focus")||"").split(",").map(x=>x.trim()).filter(Boolean).slice(0,10);
       const data=await scan(focus);
       if(url.pathname==="/json")return Response.json(data,{headers:{"cache-control":"no-store"}});
       const ready=env?.BINGX_API_KEY&&env?.BINGX_SECRET_KEY&&env?.TRADE_APPROVAL_SECRET;

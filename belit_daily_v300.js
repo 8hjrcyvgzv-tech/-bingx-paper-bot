@@ -5,6 +5,9 @@ export const V221_BELIT = {
   armedDistancePct: 1.5,
   maxSignalsPerScan: 2,
   maxWatchPerScan: 5,
+  maxDiscoveryPerScan: 5,
+  minDiscoveryScore: 6.5,
+  maxDiscoveryDistancePct: 8,
   dailyLookback: 220,
 };
 
@@ -144,6 +147,72 @@ function directionalSqueeze(rows,direction){
   }
   const highs=c.map(a=>Math.max(...a.map(x=>x.high)));
   return highs[1]<=highs[0]*1.005&&highs[2]<=highs[1]*1.005&&highs[2]<highs[0];
+}
+
+function risingSwingLows(rows){
+  const pts=swings(rows,"LOW",2).slice(-4);
+  if(pts.length<3)return false;
+  const p=pts.slice(-3).map(x=>x.price);
+  return p[1]>=p[0]*0.985&&p[2]>=p[1]*0.985&&p[2]>p[0]*1.01;
+}
+function fallingSwingHighs(rows){
+  const pts=swings(rows,"HIGH",2).slice(-4);
+  if(pts.length<3)return false;
+  const p=pts.slice(-3).map(x=>x.price);
+  return p[1]<=p[0]*1.015&&p[2]<=p[1]*1.015&&p[2]<p[0]*0.99;
+}
+function boundarySpanDays(boundary){
+  const pts=arr(boundary?.points);
+  if(pts.length<2)return 0;
+  const times=pts.map(x=>Number(x.time||0)).filter(x=>x>0);
+  if(times.length<2)return Math.max(0,Number(boundary?.lastIndex||0)-Number(pts[0]?.index||0));
+  return Math.max(0,(Math.max(...times)-Math.min(...times))/(24*60*60*1000));
+}
+function discoverySide(rows,x,direction,a,current,highClusters,lowClusters,comp){
+  const boundary=direction==="LONG"?pickBoundary(highClusters,current,a,"RESISTANCE"):pickBoundary(lowClusters,current,a,"SUPPORT");
+  if(!boundary||boundary.tests<2)return null;
+  const market=num(x?.lastPrice)||current;
+  const distPct=direction==="LONG"?(boundary.level-market)/market*100:(market-boundary.level)/market*100;
+  if(distPct<0||distPct>V221_BELIT.maxDiscoveryDistancePct)return null;
+  const smas=smaState(rows,direction);
+  const squeeze=directionalSqueeze(rows,direction);
+  const structure=rows.slice(-100);
+  const staircase=direction==="LONG"?risingSwingLows(structure):fallingSwingHighs(structure);
+  const spanDays=boundarySpanDays(boundary);
+  const trend4=String(x?.trend4h||"NEUTRAL"),trend1=String(x?.trend1h||"NEUTRAL");
+  const opposite=direction==="LONG"?"SHORT":"LONG";
+  const stronglyOpposite=trend4===opposite&&trend1===opposite;
+  if(stronglyOpposite)return null;
+  let score=0;
+  score+=boundary.tests>=4?2:boundary.tests===3?1.5:1;
+  score+=distPct<=1.5?2:distPct<=3?1.5:distPct<=5?1.25:0.75;
+  if(comp.ok)score+=1.25;
+  if(squeeze)score+=1.25;
+  if(staircase)score+=1.25;
+  score+=Math.min(1.25,smas.score*0.5);
+  if(spanDays>=20)score+=0.75; else if(spanDays>=10)score+=0.5;
+  if(trend4===direction||trend1===direction)score+=0.5;
+  // Discovery'de hacim şart değildir; yalnız çok güçlü hazırlık hafif bonus alır.
+  if(num(x?.volumeRatio)>=1.2)score+=0.25;
+  score=clamp(Math.round(score*4)/4,0,10);
+  return {direction,score,boundary:boundary.level,boundaryTests:boundary.tests,distPct,compression:Boolean(comp.ok),squeeze,staircase,sma:smas.label,smaScore:smas.score,spanDays:round2(spanDays)};
+}
+export function analyzeDiscovery(rows,x){
+  rows=arr(rows);
+  const currentRow=rows.at(-1),completed=rows.length>3?rows.slice(0,-1):rows.slice();
+  if(!currentRow||completed.length<45)return {candidate:false,score:0};
+  const a=atr(completed,20); if(!(a>0))return {candidate:false,score:0};
+  const structure=completed.slice(-100),tol=Math.max(a*0.55,currentRow.close*0.012);
+  const highClusters=clusters(swings(structure,"HIGH"),tol),lowClusters=clusters(swings(structure,"LOW"),tol);
+  const comp=compression(completed);
+  const long=discoverySide(completed.concat([currentRow]),x,"LONG",a,currentRow.close,highClusters,lowClusters,comp);
+  const short=discoverySide(completed.concat([currentRow]),x,"SHORT",a,currentRow.close,highClusters,lowClusters,comp);
+  const best=[long,short].filter(Boolean).sort((a,b)=>b.score-a.score)[0];
+  if(!best)return {candidate:false,score:0};
+  const funding=num(x?.fundingRate);
+  const fundingOk=funding==null||Math.abs(funding)<0.003;
+  const candidate=best.score>=V221_BELIT.minDiscoveryScore&&fundingOk&&!isSyntheticSymbol(x?.symbol);
+  return {candidate,score:best.score,direction:best.direction,boundary:round2(best.boundary),boundaryTests:best.boundaryTests,distancePct:round2(best.distPct),compression:best.compression,squeeze:best.squeeze,staircase:best.staircase,sma:best.sma,baseSpanDays:best.spanDays,fundingOk};
 }
 
 function smaState(rows,direction){
@@ -384,8 +453,8 @@ export async function enrichBelitData(raw){
     const enriched=await Promise.all(batch.map(async x=>{
       if(x?.error)return x;
       let b={stage:"NONE",publicStatus:"WAIT",setupQuality:0,triggerReadiness:0,executionScore:null,entryQuality:num(x?.score)||0,watchCandidate:false,extended:false,isCore5:CORE5.has(String(x?.symbol||"").toUpperCase())};
-      let belitError=null;
-      try{ b=analyzeBelitDaily(await getDailyKlines(x.symbol),x); }catch(e){ belitError=String(e?.message||e); }
+      let discovery={candidate:false,score:0},belitError=null;
+      try{ const daily=await getDailyKlines(x.symbol); b=analyzeBelitDaily(daily,x); discovery=analyzeDiscovery(daily,x); }catch(e){ belitError=String(e?.message||e); }
       const out={
         ...x,
         belitStage:b.stage,publicStatus:b.publicStatus||"WAIT",setupQuality:b.setupQuality,triggerReadiness:b.triggerReadiness??b.entryQuality??0,executionScore:b.executionScore??null,
@@ -394,7 +463,8 @@ export async function enrichBelitData(raw){
         distanceFromBoundaryATR:b.distanceFromBoundaryATR??null,barsSinceBreak:b.barsSinceBreak??null,persistentBreakout:Boolean(b.persistentBreakout),
         compressionRatio:b.compressionRatio??null,compressionTightPct:b.compressionTightPct??null,directionalSqueeze:Boolean(b.directionalSqueeze),
         adr20Pct:b.adr20Pct??null,atr20DailyPct:b.atr20Pct??null,volatilitySanity:b.volatilitySanity??null,volatilityRatio:b.volatilityRatio??null,
-        smaDaily:b.smaDaily??null,smaStackScore:b.smaStackScore??null,isCore5:b.isCore5??CORE5.has(String(x?.symbol||"").toUpperCase()),belitError
+        smaDaily:b.smaDaily??null,smaStackScore:b.smaStackScore??null,isCore5:b.isCore5??CORE5.has(String(x?.symbol||"").toUpperCase()),
+        discoveryCandidate:Boolean(discovery.candidate),discoveryScore:discovery.score??0,discoveryDirection:discovery.direction??null,discoveryBoundary:discovery.boundary??null,discoveryBoundaryTests:discovery.boundaryTests??0,discoveryDistancePct:discovery.distancePct??null,discoveryCompression:Boolean(discovery.compression),discoverySqueeze:Boolean(discovery.squeeze),discoveryStaircase:Boolean(discovery.staircase),discoverySma:discovery.sma??null,discoveryBaseSpanDays:discovery.baseSpanDays??null,belitError
       };
       out.v223Qualifies=isV223Signal(out);
       out.v221Qualifies=out.v223Qualifies;
@@ -411,5 +481,9 @@ export async function enrichBelitData(raw){
   const watch=all.filter(x=>x.belitWatchCandidate&&!signalSymbols.has(x.symbol))
     .sort((a,b)=>(b.publicStatus==="ARMED")-(a.publicStatus==="ARMED")||(Number(b.setupQuality)||0)-(Number(a.setupQuality)||0)||(Number(b.triggerReadiness)||0)-(Number(a.triggerReadiness)||0)||Math.abs(Number(a.distanceToBoundaryPct)||99)-Math.abs(Number(b.distanceToBoundaryPct)||99))
     .slice(0,V221_BELIT.maxWatchPerScan);
-  return {...raw,version:"TOP100_V2_24_FAST",signals,watch,all};
+  const watchSymbols=new Set(watch.map(x=>x.symbol));
+  const discovery=all.filter(x=>x.discoveryCandidate&&!signalSymbols.has(x.symbol)&&!watchSymbols.has(x.symbol))
+    .sort((a,b)=>(Number(b.discoveryScore)||0)-(Number(a.discoveryScore)||0)||Math.abs(Number(a.discoveryDistancePct)||99)-Math.abs(Number(b.discoveryDistancePct)||99))
+    .slice(0,V221_BELIT.maxDiscoveryPerScan);
+  return {...raw,version:"BINGX_WIDE_V3_1_DISCOVERY",signals,watch,discovery,all};
 }
