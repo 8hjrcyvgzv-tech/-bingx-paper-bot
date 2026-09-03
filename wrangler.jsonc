@@ -1,6 +1,6 @@
 {
   "name": "bingx-paper-bot",
-  "main": "worker_top100_v224_fast_trigger.js",
+  "main": "worker_top100_v300_hybrid.js",
   "compatibility_date": "2026-08-28",
   "keep_vars": true,
   "triggers": {
