@@ -3,7 +3,7 @@ import { enrichHybridData, isV300Signal, stageLabel, publicStatusLabel } from ".
 
 const BASE_URL = "https://bingx-paper-bot.yasinaltas39.workers.dev";
 const V219 = {
-  version: "V3.0",
+  version: "V3.0.2",
   minScore: 5.5,
   minAdx4h: 22,
   minVolumeRatio: 1.05,
@@ -27,6 +27,14 @@ function marginForQuality(q){
   return Math.max(5,Math.min(7,Math.round(5+((q-7.5)/0.5)*2)));
 }
 function marginForSignal(x){ return marginForQuality(x?.executionScore??x?.entryQuality??x?.score); }
+function errInfo(stage,e){
+  const message=String(e?.message||e||"bilinmeyen hata");
+  const stack=String(e?.stack||"").split("\n").slice(0,4).join(" | ");
+  console.error(`V3.0.2 ${stage}`,stack||message);
+  return {stage,message,stack};
+}
+function emptyPaper(error=null){return {ok:false,stats:{open:0,closed:0,winRatePct:0,totalOpenUSDT:0},trades:[],error};}
+
 
 function isSyntheticSymbol(symbol){
   const s=String(symbol||"").toUpperCase();
@@ -248,7 +256,7 @@ function paperSummaryHtml(paper){
   const freshWins=freshClosed.filter(t=>Number(t.realizedR)>0.0001).length;
   const freshWr=freshClosed.length?100*freshWins/freshClosed.length:0;
   const totalOpen=Number(s.open||0),totalClosed=Number(s.closed||0);
-  return `V3.0 YENİ: <b>${freshOpen.length} açık</b> · ${freshClosed.length} kapanan · Win %${freshWr.toFixed(1)} · <span class="muted">Geçmiş kayıt: ${totalOpen} açık / ${totalClosed} kapanan</span>`;
+  return `V3.0.2 YENİ: <b>${freshOpen.length} açık</b> · ${freshClosed.length} kapanan · Win %${freshWr.toFixed(1)} · <span class="muted">Geçmiş kayıt: ${totalOpen} açık / ${totalClosed} kapanan</span>`;
 }
 
 function openPaperHtml(paper){
@@ -280,7 +288,7 @@ function watchHtml(data){
 
 function page(data,paper,migration){
   const archived=Number(migration?.archivedTrades||0);
-  return `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>BingX Paper Bot V3.0 Hybrid Consensus</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:860px;margin:auto;padding:18px;background:#0b0d10;color:#f4f4f5}.card,.paperWrap{background:#171a1f;border:1px solid #2a2f37;border-radius:14px;padding:14px;margin:10px 0;line-height:1.55}.paperWrap{background:#111419}.paperCard{padding:10px 0;border-bottom:1px solid #2a2f37}.paperCard:last-child{border-bottom:0}.row{display:flex;justify-content:space-between;gap:12px}.good{color:#4ade80}.warn{color:#facc15}.bad{color:#fb7185}.muted,small{color:#a1a1aa}.notifyBtn{margin:10px 6px 4px 0;padding:10px 14px;border:0;border-radius:10px;font-weight:700}</style><div class="head"><h2>BingX Paper Bot · Top100 V3.0 · Emre + Aksel + Belit Consensus</h2><div><b>PAPER/TEST ONLY</b> · EXECUTION_MODE zorla TEST · BTC ${esc(data.btcDirection)}</div><div><b>Emre katmanı:</b> 4s+1s HTF yön · 1G SMA rejimi · 4s RSI · objektif impuls/Fibonacci retracement · invalidation</div><div><b>Aksel katmanı:</b> yatay boundary/test + 4s flag/channel · kapanışla kırılım/retest · pattern invalidation · giriş güncelliği</div><div><b>Belit katmanı:</b> SMA10/20/50/100/200 · sıkışma · hacim/baskı · ADR/ATR · 15dk tetik · KAÇTI/KOVALAMA</div><div><b>PAPER GİR:</b> üçlü konsensüs + Hybrid Execution ≥7.5 · Emre ≥6 · Aksel ≥6.5 · Belit ≥6.25 · Last/Mark geçerli · risk/hedef geçerli</div><div>5x isolated · margin 7.5–7.9 = 5–7 USDT · 8.0–8.5 = 10 · 9+ = 15 · max 5 açık · aynı yön max 3 · en iyi 1–2 tetik</div><div>İlk 10 likit + CORE5 her dakika · en iyi 5 watch hızlı takip · Top100 ~10 dk tam tur · Telegram yalnız PAPER GİR</div><div>${paperSummaryHtml(paper)}</div><div class="muted">Geçmiş V2.x paper kayıtları korunur; V3.0 ayrı yeni örneklem olarak sayılır. Elliott dalga sayımı otomatik ve öznel olduğu için V3.0 Emre katmanında yalnız objektif HTF/Fib/momentum bileşenleri kullanılır.</div><button class="notifyBtn" onclick="testNotify(this)">BİLDİRİM TESTİ</button><button class="notifyBtn" onclick="testBingx(this)">BINGX BAĞLANTI TESTİ</button><div>Top100 likit evren · Dilim ${esc(data.shard)}/${esc(data.shardCount)} · Bu tur ${(data.all||[]).length} coin · PAPER GİR ${(data.signals||[]).length} · HAZIR/ARMED ${(data.watch||[]).length}</div><small>Son tarama ${esc(data.scannedAt)}</small></div><div class="paperWrap"><b>ÜÇLÜ KONSENSÜS RADARI</b>${watchHtml(data)}</div><div class="paperWrap"><b>AÇIK AUTO PAPER POZİSYONLARI</b>${openPaperHtml(paper)}</div>${scanCards(data)}<script>async function testNotify(btn){const old=btn.textContent;btn.disabled=true;btn.textContent="Gönderiliyor...";try{const r=await fetch('/notify-test',{method:'POST'});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'hata');alert('Test bildirimi gönderildi');}catch(e){alert('Bildirim testi başarısız: '+e.message);}finally{btn.disabled=false;btn.textContent=old;}}async function testBingx(btn){if(!confirm('BingX API ve TEST emir yolunu kontrol edelim mi? Gerçek pozisyon açılmaz.'))return;const old=btn.textContent;btn.disabled=true;btn.textContent='Kontrol ediliyor...';try{const r=await fetch('/bingx-connection-test',{method:'POST'});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'hata');alert('BINGX TEST BAŞARILI — gerçek pozisyon açılmadı.');}catch(e){alert('BingX testi başarısız: '+e.message);}finally{btn.disabled=false;btn.textContent=old;}}</script>`;
+  return `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>BingX Paper Bot V3.0.1 Hybrid Consensus</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:860px;margin:auto;padding:18px;background:#0b0d10;color:#f4f4f5}.card,.paperWrap{background:#171a1f;border:1px solid #2a2f37;border-radius:14px;padding:14px;margin:10px 0;line-height:1.55}.paperWrap{background:#111419}.paperCard{padding:10px 0;border-bottom:1px solid #2a2f37}.paperCard:last-child{border-bottom:0}.row{display:flex;justify-content:space-between;gap:12px}.good{color:#4ade80}.warn{color:#facc15}.bad{color:#fb7185}.muted,small{color:#a1a1aa}.notifyBtn{margin:10px 6px 4px 0;padding:10px 14px;border:0;border-radius:10px;font-weight:700}</style><div class="head"><h2>BingX Paper Bot · Top100 V3.0.1 · Emre + Aksel + Belit Consensus</h2><div><b>PAPER/TEST ONLY</b> · EXECUTION_MODE zorla TEST · BTC ${esc(data.btcDirection)}</div><div><b>Emre katmanı:</b> 4s+1s HTF yön · 1G SMA rejimi · 4s RSI · objektif impuls/Fibonacci retracement · invalidation</div><div><b>Aksel katmanı:</b> yatay boundary/test + 4s flag/channel · kapanışla kırılım/retest · pattern invalidation · giriş güncelliği</div><div><b>Belit katmanı:</b> SMA10/20/50/100/200 · sıkışma · hacim/baskı · ADR/ATR · 15dk tetik · KAÇTI/KOVALAMA</div><div><b>PAPER GİR:</b> üçlü konsensüs + Hybrid Execution ≥7.5 · Emre ≥6 · Aksel ≥6.5 · Belit ≥6.25 · Last/Mark geçerli · risk/hedef geçerli</div><div>5x isolated · margin 7.5–7.9 = 5–7 USDT · 8.0–8.5 = 10 · 9+ = 15 · max 5 açık · aynı yön max 3 · en iyi 1–2 tetik</div><div>İlk 10 likit + CORE5 her dakika · en iyi 5 watch hızlı takip · Top100 ~10 dk tam tur · Telegram yalnız PAPER GİR</div><div>${paperSummaryHtml(paper)}</div><div class="muted">Geçmiş V2.x paper kayıtları korunur; V3.0.2 ayrı yeni örneklem olarak sayılır. Elliott dalga sayımı otomatik ve öznel olduğu için V3.0 Emre katmanında yalnız objektif HTF/Fib/momentum bileşenleri kullanılır.</div><button class="notifyBtn" onclick="testNotify(this)">BİLDİRİM TESTİ</button><button class="notifyBtn" onclick="testBingx(this)">BINGX BAĞLANTI TESTİ</button><div>Top100 likit evren · Dilim ${esc(data.shard)}/${esc(data.shardCount)} · Bu tur ${(data.all||[]).length} coin · PAPER GİR ${(data.signals||[]).length} · HAZIR/ARMED ${(data.watch||[]).length}</div><small>Son tarama ${esc(data.scannedAt)}</small></div><div class="paperWrap"><b>ÜÇLÜ KONSENSÜS RADARI</b>${watchHtml(data)}</div><div class="paperWrap"><b>AÇIK AUTO PAPER POZİSYONLARI</b>${openPaperHtml(paper)}</div>${scanCards(data)}<script>async function testNotify(btn){const old=btn.textContent;btn.disabled=true;btn.textContent="Gönderiliyor...";try{const r=await fetch('/notify-test',{method:'POST'});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'hata');alert('Test bildirimi gönderildi');}catch(e){alert('Bildirim testi başarısız: '+e.message);}finally{btn.disabled=false;btn.textContent=old;}}async function testBingx(btn){if(!confirm('BingX API ve TEST emir yolunu kontrol edelim mi? Gerçek pozisyon açılmaz.'))return;const old=btn.textContent;btn.disabled=true;btn.textContent='Kontrol ediliyor...';try{const r=await fetch('/bingx-connection-test',{method:'POST'});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'hata');alert('BINGX TEST BAŞARILI — gerçek pozisyon açılmadı.');}catch(e){alert('BingX testi başarısız: '+e.message);}finally{btn.disabled=false;btn.textContent=old;}}</script>`;
 }
 
 export class PaperTracker extends BasePaperTracker {
@@ -292,7 +300,7 @@ export class PaperTracker extends BasePaperTracker {
     const archive={version:"V2.x",archivedAt,trades:oldTrades};
     await this.state.storage.put("archive_v218",archive);
     await this.state.storage.put("trades",[]);
-    const m={version:"V3.0",archivedAt,archivedTrades:oldTrades.length};
+    const m={version:"V3.0.2",archivedAt,archivedTrades:oldTrades.length};
     await this.state.storage.put("v219_migrated",m);
     await this.state.storage.put("v219_alerts",{});
     await this.state.storage.put("v220_watch_alerts",{});
@@ -319,7 +327,7 @@ export class PaperTracker extends BasePaperTracker {
       if(before.has(t.id))continue;
       const s=selected.find(x=>x.symbol===t.symbol&&x.direction===t.direction);
       if(!s)continue;
-      t.scannerVersion="V3.0";
+      t.scannerVersion="V3.0.2";
       t.setupQuality=Number(s.setupQuality||0);
       t.entryQuality=Number(s.entryQuality||0);
       t.triggerReadiness=Number(s.triggerReadiness||s.entryQuality||0);
@@ -413,10 +421,14 @@ export default {
     const url=new URL(request.url);
     if(url.pathname==="/notify-test"){
       if(request.method!=="POST")return new Response("Method Not Allowed",{status:405});
-      try{const channel=await sendPrimary(env,"BingX BİLDİRİM TESTİ · V3.0","Bildirim kanalı çalışıyor. V3.0 Emre+Aksel+Belit üçlü konsensüs aktiftir. Telegram yalnız PAPER GİR LONG/SHORT sinyallerini gönderir. Worker EXECUTION_MODE zorla TEST kilitlidir; gerçek emir açılamaz.");return Response.json({ok:true,channel},{headers:{"cache-control":"no-store"}});}catch(e){return Response.json({ok:false,error:String(e?.message||e)},{status:500});}
+      try{const channel=await sendPrimary(env,"BingX BİLDİRİM TESTİ · V3.0.2","Bildirim kanalı çalışıyor. V3.0.2 Emre+Aksel+Belit üçlü konsensüs aktiftir. Telegram yalnız PAPER GİR LONG/SHORT sinyallerini gönderir. Worker EXECUTION_MODE zorla TEST kilitlidir; gerçek emir açılamaz.");return Response.json({ok:true,channel},{headers:{"cache-control":"no-store"}});}catch(e){return Response.json({ok:false,error:String(e?.message||e)},{status:500});}
     }
     if(url.pathname==="/json"){
-      try{const focus=await getFastWatch(env);return Response.json(await scanThroughBase(env,focus.map(x=>x.symbol)),{headers:{"cache-control":"no-store"}});}catch(e){return Response.json({ok:false,error:String(e?.message||e)},{status:500});}
+      try{
+        const focus=await getFastWatch(env);
+        const data=await scanThroughBase(env,(Array.isArray(focus)?focus:[]).map(x=>x?.symbol).filter(Boolean));
+        return Response.json(data,{headers:{"cache-control":"no-store"}});
+      }catch(e){const info=errInfo("JSON_SCAN",e);return Response.json({ok:false,error:info.message,stage:info.stage,stack:info.stack},{status:500,headers:{"cache-control":"no-store"}});}
     }
     if(url.pathname==="/paper-stats"){
       try{return Response.json(await paperSnapshot(env),{headers:{"cache-control":"no-store"}});}catch(e){return Response.json({ok:false,error:String(e?.message||e)},{status:500});}
@@ -424,12 +436,17 @@ export default {
     if(url.pathname==="/v219-migration"||url.pathname==="/v219-archive")return trackerStub(env).fetch(`https://paper.local${url.pathname}`);
 
     if(url.pathname==="/"||url.pathname===""){
-      try{
-        const focus=await getFastWatch(env);
-        const [data,paper,migRes]=await Promise.all([scanThroughBase(env,focus.map(x=>x.symbol)),paperSnapshot(env),trackerStub(env).fetch("https://paper.local/v219-migration")]);
-        const migration=migRes.ok?await migRes.json():{};
-        return new Response(page(data,paper,migration),{headers:{"content-type":"text/html; charset=UTF-8","cache-control":"no-store"}});
-      }catch(e){return new Response(`Bot hatası: ${String(e?.message||e)}`,{status:500});}
+      let focus=[],data=null,paper=null,migration={},scanError=null,paperError=null;
+      try{focus=await getFastWatch(env);}catch(e){errInfo("FAST_WATCH",e);focus=[];}
+      try{data=await scanThroughBase(env,(Array.isArray(focus)?focus:[]).map(x=>x?.symbol).filter(Boolean));}
+      catch(e){scanError=errInfo("SCAN",e);}
+      try{paper=await paperSnapshot(env);}catch(e){paperError=errInfo("PAPER_STATS",e);paper=emptyPaper(String(e?.message||e));}
+      try{const migRes=await trackerStub(env).fetch("https://paper.local/v219-migration");migration=migRes.ok?await migRes.json():{};}catch(e){errInfo("MIGRATION",e);migration={};}
+      if(!data){
+        const detail=scanError?.stack?`<div style="margin-top:12px;color:#666;font-size:13px">Aşama: ${esc(scanError.stage)} · ${esc(scanError.stack)}</div>`:"";
+        return new Response(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:24px"><h2>BingX Paper Bot · V3.0.2</h2><p><b>Tarama geçici olarak durdu.</b> PAPER/TEST kilidi aktif; gerçek emir açılamaz.</p><p>Hata aşaması: <b>${esc(scanError?.stage||"SCAN")}</b><br>${esc(scanError?.message||"bilinmeyen hata")}</p>${detail}<p>Paper istatistik katmanı: ${paperError?"hata":"çalışıyor"}</p></body>`,{status:500,headers:{"content-type":"text/html; charset=UTF-8","cache-control":"no-store"}});
+      }
+      return new Response(page(data,paper||emptyPaper(),migration),{headers:{"content-type":"text/html; charset=UTF-8","cache-control":"no-store"}});
     }
 
     // Trade, signal landing, BingX connection test and other established routes stay on V2.17's proven execution bridge.
@@ -437,15 +454,17 @@ export default {
   },
 
   async scheduled(controller,env,ctx){
-    const focus=await getFastWatch(env);
-    const data=await scanThroughBase(env,focus.map(x=>x.symbol));
-    const paper=await paperTick(env,data);
+    const focus=await getFastWatch(env).catch(()=>[]);
+    let data;
+    try{data=await scanThroughBase(env,(Array.isArray(focus)?focus:[]).map(x=>x?.symbol).filter(Boolean));}
+    catch(e){errInfo("CRON_SCAN",e);return;}
+    const paper=await paperTick(env,data).catch(e=>{errInfo("CRON_PAPER",e);return {stats:null};});
     const fastWatch=await updateFastWatch(env,data);
     // Telegram is intentionally signal-only in V3.0.
     // HAZIRLANIYOR / ARMED / other early-warning candidates remain visible on the web radar,
     // but they are not claimed or pushed to Telegram.
     const alerts=await claimAlerts(env,data.signals||[],data.scannedAt);
-    console.log(JSON.stringify({cron:controller.cron,version:"V3.0",scannedAt:data.scannedAt,shard:data.shard,scanned:data.all?.length||0,qualified:data.signals?.length||0,watch:data.watch?.length||0,fastWatch:(fastWatch?.watch||focus).map(x=>x.symbol),alerts:alerts.length,telegramWatchAlerts:0,paper:paper?.stats||null}));
+    console.log(JSON.stringify({cron:controller.cron,version:"V3.0.2",scannedAt:data.scannedAt,shard:data.shard,scanned:data.all?.length||0,qualified:data.signals?.length||0,watch:data.watch?.length||0,fastWatch:(fastWatch?.watch||focus).map(x=>x.symbol),alerts:alerts.length,telegramWatchAlerts:0,paper:paper?.stats||null}));
     if(alerts.length){
       ctx.waitUntil((async()=>{
         for(const x of alerts){

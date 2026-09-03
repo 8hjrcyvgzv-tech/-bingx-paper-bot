@@ -11,7 +11,8 @@ export const V221_BELIT = {
 const CORE5 = new Set(["BTC-USDT","ETH-USDT","SOL-USDT","XRP-USDT","DOGE-USDT"]);
 
 function num(v){ const n=Number(v); return Number.isFinite(n)?n:null; }
-function avg(a){ return a.length?a.reduce((x,y)=>x+y,0)/a.length:0; }
+function arr(v){ return Array.isArray(v)?v:[]; }
+function avg(a){ a=arr(a); return a.length?a.reduce((x,y)=>x+y,0)/a.length:0; }
 function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
 function round2(v){ return Number.isFinite(v)?Math.round(v*100)/100:null; }
 function isSyntheticSymbol(symbol){
@@ -41,18 +42,20 @@ async function getDailyKlines(symbol,limit=V221_BELIT.dailyLookback){
   return rows;
 }
 
-function sma(values,p){ return values.length<p?null:avg(values.slice(-p)); }
+function sma(values,p){ values=arr(values); return values.length<p?null:avg(values.slice(-p)); }
 function tr(rows,i){
   if(i<=0)return rows[i].high-rows[i].low;
   const prev=rows[i-1].close;
   return Math.max(rows[i].high-rows[i].low,Math.abs(rows[i].high-prev),Math.abs(rows[i].low-prev));
 }
 function atr(rows,p=20){
+  rows=arr(rows);
   if(rows.length<=p)return null;
   const vals=[]; for(let i=rows.length-p;i<rows.length;i++)vals.push(tr(rows,i));
   return avg(vals);
 }
 function adrPct(rows,p=20){
+  rows=arr(rows);
   if(rows.length<p)return null;
   const vals=rows.slice(-p).map(r=>r.low>0?((r.high-r.low)/r.low)*100:null).filter(Number.isFinite);
   return vals.length?avg(vals):null;
@@ -238,6 +241,7 @@ export function fastIntradayTrigger(level,direction,x){
 }
 
 export function analyzeBelitDaily(rows,x){
+  rows=arr(rows);
   const current=rows.at(-1),completed=rows.length>3?rows.slice(0,-1):rows.slice();
   const direction=["LONG","SHORT"].includes(x?.direction)?x.direction:"NEUTRAL";
   if(!current||direction==="NEUTRAL")return {stage:"NONE",publicStatus:"WAIT",setupQuality:0,triggerReadiness:0,executionScore:null,entryQuality:0,watchCandidate:false,extended:false};

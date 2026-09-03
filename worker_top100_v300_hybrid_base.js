@@ -55,8 +55,9 @@ function tradePaperMargin(trade){
   return Number.isFinite(m)&&m>0?m:CFG.liveMarginUSDT; // legacy kayıtlar 20 USDT olarak kalır
 }
 
-function avg(arr) { return arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0; }
-function sum(arr) { return arr.reduce((a,b)=>a+b,0); }
+function asArray(v){ return Array.isArray(v)?v:[]; }
+function avg(arr) { arr=asArray(arr); return arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0; }
+function sum(arr) { arr=asArray(arr); return arr.reduce((a,b)=>a+b,0); }
 
 function ema(values, period) {
   if (values.length < period) return null;
@@ -222,6 +223,7 @@ function ema200Alignment(rows, direction) {
 }
 
 function volumePressure(rows, lookback=6) {
+  rows=asArray(rows);
   const recent=rows.slice(-lookback);
   let weightedFlow=0, totalVol=0;
   for (const r of recent) {
@@ -388,6 +390,7 @@ function shardIndexFor(shardCount,date=new Date()){
 }
 
 async function scan(extraSymbols=[]){
+  extraSymbols=asArray(extraSymbols);
   const [top,premiumMap,btc4h,btc1h,btc15]=await Promise.all([
     getTopSymbols(CFG.universeSize),
     getPremiumIndexMap(),
@@ -401,18 +404,19 @@ async function scan(extraSymbols=[]){
   const btcDir=btc4!=="NEUTRAL"?btc4:(btc1===btc15dir?btc1:"NEUTRAL");
 
   const shardCount=Math.ceil(top.length/CFG.shardSize), shardIndex=shardIndexFor(shardCount);
-  const shardItems=top.slice(shardIndex*CFG.shardSize,(shardIndex+1)*CFG.shardSize);
+  const topSafe=asArray(top);
+  const shardItems=topSafe.slice(shardIndex*CFG.shardSize,(shardIndex+1)*CFG.shardSize);
   const focusSet=new Set((Array.isArray(extraSymbols)?extraSymbols:[]).map(String));
   const coreSet=new Set(CORE5);
-  const fastLiquidItems=top.slice(0,FAST_LIQUID_COUNT);
+  const fastLiquidItems=topSafe.slice(0,FAST_LIQUID_COUNT);
   const selectedMap=new Map();
   // Her dakika: en likit 10 + CORE5 garantisi + en iyi 5 armed/watch.
   // Ayrıca rotating shard sayesinde Top100'ün tamamı yaklaşık 10 dakikada bir yeniden görülür.
-  for(const item of [...fastLiquidItems,...top.filter(x=>coreSet.has(x.symbol)),...top.filter(x=>focusSet.has(x.symbol)),...shardItems])selectedMap.set(item.symbol,item);
+  for(const item of [...fastLiquidItems,...topSafe.filter(x=>coreSet.has(x.symbol)),...topSafe.filter(x=>focusSet.has(x.symbol)),...shardItems])if(item?.symbol)selectedMap.set(item.symbol,item);
   const selected=[...selectedMap.values()],results=[];
 
   for(let i=0;i<selected.length;i+=2){
-    const batch=selected.slice(i,i+2);
+    const batch=asArray(selected).slice(i,i+2);
     const batchResults=await Promise.all(batch.map(async item=>{
       try{
         let h4,h1,m15;
@@ -1277,10 +1281,12 @@ export class PaperTracker{
   }
 
   async loadTrades(){
-    return (await this.state.storage.get("trades"))||[];
+    const v=await this.state.storage.get("trades");
+    return Array.isArray(v)?v:[];
   }
 
   async saveTrades(trades){
+    trades=asArray(trades);
     const trimmed=trades
       .sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt))
       .slice(0,CFG.paperMaxTrades);
@@ -1444,7 +1450,7 @@ export class PaperTracker{
 
     if(url.pathname==="/stats"){
       const trades=await this.loadTrades();
-      const sorted=[...trades].sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt));
+      const sorted=[...asArray(trades)].sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt));
       return Response.json({
         ok:true,
         stats:paperSummary(sorted),

@@ -1,3 +1,7 @@
+V3.0.2 HARDENED HOTFIX
+
+V3.0.1 HOTFIX: Coin bazlı hata izolasyonu eklendi;  Yönü henüz oluşmamış coinlerde hybridReasons oluşturulurken undefined.slice hatası engellendi. Tek bir eksik veri satırı artık taramanın tamamını düşürmez. V3.0 paper örneklemi korunur.
+
 BingX Paper Bot V3.0 — Emre + Aksel + Belit Consensus
 
 PAPER/TEST ONLY. worker env EXECUTION_MODE zorla TEST'e çevrilir.

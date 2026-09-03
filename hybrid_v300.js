@@ -8,7 +8,8 @@ const CFG={minHybridSetup:7.5,minExecution:7.5,minEmre:6,minAksel:6.5,minBelit:6
 const num=v=>{const n=Number(v);return Number.isFinite(n)?n:null;};
 const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
 const round2=v=>Number.isFinite(v)?Math.round(v*100)/100:null;
-const avg=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:0;
+const arr=v=>Array.isArray(v)?v:[];
+const avg=a=>arr(a).length?arr(a).reduce((x,y)=>x+y,0)/arr(a).length:0;
 
 function atr(rows,p=14){
   if(!Array.isArray(rows)||rows.length<=p)return null;
@@ -22,7 +23,7 @@ function lin(values){
   return {slope,intercept,at:i=>intercept+slope*i};
 }
 function impulseFib(x){
-  const rows=(x?.recent4hBars||[]).slice(-54); const dir=x?.direction;
+  const rows=arr(x?.recent4hBars).slice(-54); const dir=x?.direction;
   if(rows.length<28||!["LONG","SHORT"].includes(dir))return {valid:false,score:0,retracement:null,impulsePct:null,invalid:false,label:"YOK"};
   const cut=Math.max(12,Math.floor(rows.length*0.68));
   let startI=-1,endI=-1,start=null,end=null;
@@ -46,7 +47,7 @@ function impulseFib(x){
   return {valid:true,score,retracement:round2(retr),impulsePct:round2(impulsePct),invalid,label,start,end,startI,endI};
 }
 function emreLayer(x){
-  const dir=x?.direction; if(!["LONG","SHORT"].includes(dir))return {score:0,invalid:true,label:"YÖN YOK",fib:impulseFib(x)};
+  const dir=x?.direction; if(!["LONG","SHORT"].includes(dir))return {score:0,invalid:true,label:"YÖN YOK",fib:impulseFib(x),reasons:["yön henüz belirlenmedi"]};
   const fib=impulseFib(x); let s=0,reasons=[];
   if(x?.trend4h===dir&&x?.trend1h===dir){s+=2.5;reasons.push("4s+1s HTF uyum");}
   else if(x?.trend4h===dir){s+=1.25;reasons.push("4s yön uyum");}
@@ -66,7 +67,7 @@ function emreLayer(x){
   return {score:round2(clamp(s,0,10)),invalid,label:invalid?"HTF/FIB INVALID":"HTF UYUMLU",fib,reasons};
 }
 function flagChannel(x){
-  const dir=x?.direction,rows=(x?.recent4hBars||[]).slice(-40); if(rows.length<28||!["LONG","SHORT"].includes(dir))return {candidate:false,armed:false,confirmed:false,retest:false,extended:false};
+  const dir=x?.direction,rows=arr(x?.recent4hBars).slice(-40); if(rows.length<28||!["LONG","SHORT"].includes(dir))return {candidate:false,armed:false,confirmed:false,retest:false,extended:false};
   const flagN=10,flag=rows.slice(-flagN),prior=rows.slice(-28,-flagN); if(prior.length<12)return {candidate:false,armed:false,confirmed:false,retest:false,extended:false};
   const priorMovePct=(prior.at(-1).close-prior[0].close)/prior[0].close*100;
   const hi=lin(flag.map(r=>r.high)),lo=lin(flag.map(r=>r.low)); if(!hi||!lo)return {candidate:false,armed:false,confirmed:false,retest:false,extended:false};
@@ -78,7 +79,7 @@ function flagChannel(x){
   const compact=a4>0&&width<=4.5*a4;
   const candidate=impulseOk&&channelOk&&slopeParallel&&compact;
   const boundary=dir==="LONG"?hi.at(flagN):lo.at(flagN);
-  const a15=num(x?.atr15),last=num(x?.lastPrice)||px,mark=num(x?.markPrice),bars=(x?.recent15mBars||[]).slice(-8);
+  const a15=num(x?.atr15),last=num(x?.lastPrice)||px,mark=num(x?.markPrice),bars=arr(x?.recent15mBars).slice(-8);
   const latest=bars.at(-1),prev=bars.at(-2);
   const accept=dir==="LONG"?(last>boundary&&(mark==null||mark>boundary)):(last<boundary&&(mark==null||mark<boundary));
   const closeAccept=latest? (dir==="LONG"?latest.close>boundary:latest.close<boundary):false;
@@ -151,12 +152,17 @@ function hybridOne(x){
     belitScore:belit.score,belitSetupQuality:x?.setupQuality??null,belitExecutionScore:x?.executionScore??null,
     hybridSetupScore:round2(setup),hybridExecutionScore:exec,setupQuality:round2(setup),executionScore:exec,entryQuality:exec??round2(setup),triggerReadiness:exec??round2(setup),
     publicStatus:status,hybridQualifies:qualifies,v300Qualifies:qualifies,qualifies,belitWatchCandidate:watch,hybridWatchCandidate:watch,
-    hybridReasons:[...emre.reasons.slice(0,2),...aksel.reasons.slice(0,2),`Belit ${belit.score}/10`]
+    hybridReasons:[...(Array.isArray(emre?.reasons)?emre.reasons:[]).slice(0,2),...(Array.isArray(aksel?.reasons)?aksel.reasons:[]).slice(0,2),`Belit ${belit.score}/10`]
   };
 }
 export function isV300Signal(x){ return Boolean(x?.v300Qualifies)&&Number(x?.hybridExecutionScore??x?.executionScore)>=CFG.minExecution; }
 export async function enrichHybridData(raw){
-  const b=await enrichBelitData(raw); const all=(b.all||[]).map(hybridOne);
+  const b=await enrichBelitData(raw);
+  const source=arr(b?.all);
+  const all=source.map(x=>{
+    try{return hybridOne(x);}
+    catch(e){return {...x,error:`HYBRID: ${String(e?.message||e)}`,hybridQualifies:false,v300Qualifies:false,qualifies:false,hybridWatchCandidate:false,belitWatchCandidate:false};}
+  });
   const signals=all.filter(isV300Signal).sort((a,b)=>(Number(b.hybridExecutionScore)||0)-(Number(a.hybridExecutionScore)||0)||(Number(b.hybridSetupScore)||0)-(Number(a.hybridSetupScore)||0)).slice(0,CFG.maxSignals);
   const ss=new Set(signals.map(x=>x.symbol));
   const watch=all.filter(x=>x.hybridWatchCandidate&&!ss.has(x.symbol)).sort((a,b)=>(b.publicStatus==="ARMED")-(a.publicStatus==="ARMED")||(Number(b.hybridSetupScore)||0)-(Number(a.hybridSetupScore)||0)).slice(0,CFG.maxWatch);
