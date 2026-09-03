@@ -1,6 +1,6 @@
 {
   "name": "bingx-paper-bot",
-  "main": "worker_top100_v222_signal_only_telegram.js",
+  "main": "worker_top100_v223_fast_trigger.js",
   "compatibility_date": "2026-08-28",
   "keep_vars": true,
   "triggers": {
