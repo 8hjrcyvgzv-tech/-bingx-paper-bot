@@ -1,0 +1,652 @@
+name: V4 Confirmed Gate Same-Squad A-B
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - v4-clean-core
+    paths:
+      - ".github/workflows/v4-confirmed-same-squad-ab.yml"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      V4_FROZEN_DATASET_ID: V4_CORE6_BINANCE_UM_5M_20260215_20260903_EBECBEDEEE03
+      V4_FROZEN_ROOT_SHA256: ebecbedeee03954dc9a8ff5fdabf764ebf92fb8cd90b30a659f8cbeaf9d67965
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download Frozen Dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: v4-frozen-core6-200d-dataset
+          path: frozen_dataset
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33924848219
+
+      - name: Safety and Syntax Check
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f v4_frozen_replay_harness.mjs
+          test -f v4_frozen_data_provider.mjs
+          test -f v4_replay_runner.mjs
+          test -f v4_execution.js
+          test -f v4_logic_test.mjs
+          test -f frozen_dataset/manifest.json
+          test -f frozen_dataset/data/BTC_USDT_5m.csv.gz
+
+          node --check v4_frozen_replay_harness.mjs
+          node --check v4_frozen_data_provider.mjs
+          node --check v4_execution.js
+
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' \
+            v4_frozen_replay_harness.mjs \
+            v4_frozen_data_provider.mjs
+
+          echo "V4 SAME-SQUAD A/B SAFETY: HISTORICAL READ-ONLY PASS"
+
+      - name: Logic Test
+        run: node v4_logic_test.mjs
+
+      - name: Run Frozen 100D Control
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts artifacts_ab
+          node v4_frozen_replay_harness.mjs
+          test -f artifacts/v4_replay_summary.json
+          test -f artifacts/v4_replay_signals.json
+
+      - name: Same-Squad A-B — Reclassify Exact Control Signals
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts_ab
+
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+
+          const signals = JSON.parse(
+            await readFile("artifacts/v4_replay_signals.json", "utf8")
+          );
+
+          const replaySummary = JSON.parse(
+            await readFile("artifacts/v4_replay_summary.json", "utf8")
+          );
+
+          function n(v) {
+            const x = Number(v);
+            return Number.isFinite(x) ? x : null;
+          }
+
+          function round(v, d = 4) {
+            if (!Number.isFinite(v)) return null;
+            const m = 10 ** d;
+            return Math.round(v * m) / m;
+          }
+
+          function controlRisk(e) {
+            if (e.decision === "CONFIRMED") return 0.50;
+            if (e.decision === "STARTER") {
+              return n(e.finalScore) >= 7.5 ? 0.40 : 0.25;
+            }
+            return 0;
+          }
+
+          function variantDecision(e) {
+            const score = n(e.finalScore);
+            const rr1 = n(e.rr1);
+            const rr2 = n(e.rr2);
+            const status = String(e.structureStatus || "").toUpperCase();
+            const hardVeto = e.hardVeto === true;
+
+            if (hardVeto) return "PASS";
+
+            const confirmedStructure =
+              ["BREAKOUT", "RETEST"].includes(status);
+
+            const starterStructure =
+              ["PREPARING", "ARMED", "BREAKOUT", "RETEST"].includes(status);
+
+            if (
+              score !== null &&
+              score >= 7.75 &&
+              rr2 !== null &&
+              rr2 >= 2.00 &&
+              confirmedStructure
+            ) {
+              return "CONFIRMED";
+            }
+
+            if (
+              score !== null &&
+              score >= 6.70 &&
+              rr1 !== null &&
+              rr1 >= 1.80 &&
+              starterStructure
+            ) {
+              return "STARTER";
+            }
+
+            return "WATCH";
+          }
+
+          function variantRisk(e) {
+            const d = variantDecision(e);
+
+            if (d === "CONFIRMED") {
+              return 0.50;
+            }
+
+            if (d === "STARTER") {
+              return n(e.finalScore) >= 7.5 ? 0.40 : 0.25;
+            }
+
+            return 0;
+          }
+
+          function maxDD(values) {
+            let eq = 0;
+            let peak = 0;
+            let dd = 0;
+
+            for (const v of values) {
+              if (!Number.isFinite(v)) {
+                continue;
+              }
+
+              eq += v;
+              peak = Math.max(peak, eq);
+              dd = Math.max(dd, peak - eq);
+            }
+
+            return dd;
+          }
+
+          function stats(rows, riskFn = null) {
+            const valid = rows
+              .map((e) => ({
+                ...e,
+                resultR: n(e.resultR),
+              }))
+              .filter((e) => e.resultR !== null)
+              .sort(
+                (a, b) =>
+                  n(a.timestampMs) -
+                  n(b.timestampMs)
+              );
+
+            const raw =
+              valid.map((e) => e.resultR);
+
+            const weighted =
+              riskFn
+                ? valid.map(
+                    (e) =>
+                      e.resultR *
+                      riskFn(e)
+                  )
+                : [];
+
+            const wins =
+              raw.filter((x) => x > 0);
+
+            const losses =
+              raw.filter((x) => x < 0);
+
+            const grossWin =
+              wins.reduce(
+                (a, b) => a + b,
+                0
+              );
+
+            const grossLoss =
+              Math.abs(
+                losses.reduce(
+                  (a, b) => a + b,
+                  0
+                )
+              );
+
+            const gross =
+              raw.reduce(
+                (a, b) => a + b,
+                0
+              );
+
+            const weightedGross =
+              weighted.reduce(
+                (a, b) => a + b,
+                0
+              );
+
+            return {
+              signals:
+                valid.length,
+
+              wins:
+                wins.length,
+
+              losses:
+                losses.length,
+
+              winRatePct:
+                valid.length
+                  ? round(
+                      (
+                        wins.length /
+                        valid.length
+                      ) * 100,
+                      2
+                    )
+                  : null,
+
+              expectancyR:
+                valid.length
+                  ? round(
+                      gross /
+                        valid.length,
+                      4
+                    )
+                  : null,
+
+              profitFactor:
+                grossLoss > 0
+                  ? round(
+                      grossWin /
+                        grossLoss,
+                      4
+                    )
+                  : null,
+
+              grossR:
+                round(
+                  gross,
+                  4
+                ),
+
+              maxDrawdownR:
+                round(
+                  maxDD(raw),
+                  4
+                ),
+
+              weightedGrossRiskUnits:
+                riskFn
+                  ? round(
+                      weightedGross,
+                      4
+                    )
+                  : null,
+
+              weightedMaxDrawdownRiskUnits:
+                riskFn
+                  ? round(
+                      maxDD(weighted),
+                      4
+                    )
+                  : null,
+            };
+          }
+
+          function group(
+            rows,
+            selector,
+            riskFn = null
+          ) {
+            const m =
+              new Map();
+
+            for (const row of rows) {
+              const k =
+                selector(row);
+
+              if (!m.has(k)) {
+                m.set(
+                  k,
+                  []
+                );
+              }
+
+              m.get(k)
+                .push(row);
+            }
+
+            return Object.fromEntries(
+              [...m.entries()]
+                .sort(
+                  ([a], [b]) =>
+                    String(a)
+                      .localeCompare(
+                        String(b)
+                      )
+                )
+                .map(
+                  ([k, v]) => [
+                    k,
+                    stats(
+                      v,
+                      riskFn
+                    ),
+                  ]
+                )
+            );
+          }
+
+          if (
+            !Array.isArray(signals) ||
+            signals.length === 0
+          ) {
+            throw new Error(
+              "Control replay produced no signals"
+            );
+          }
+
+          const enriched =
+            signals.map(
+              (e) => ({
+                ...e,
+
+                controlDecision:
+                  e.decision,
+
+                variantDecision:
+                  variantDecision(e),
+
+                controlRiskR:
+                  controlRisk(e),
+
+                variantRiskR:
+                  variantRisk(e),
+              })
+            );
+
+          const sameSquad =
+            enriched.length ===
+            signals.length;
+
+          const newlyConfirmed =
+            enriched.filter(
+              (e) =>
+                e.controlDecision !==
+                  "CONFIRMED" &&
+                e.variantDecision ===
+                  "CONFIRMED"
+            );
+
+          const unchangedStarter =
+            enriched.filter(
+              (e) =>
+                e.controlDecision ===
+                  "STARTER" &&
+                e.variantDecision ===
+                  "STARTER"
+            );
+
+          const transitions = {};
+
+          for (const e of enriched) {
+            const k =
+              `${e.controlDecision}->${e.variantDecision}`;
+
+            transitions[k] =
+              (
+                transitions[k] ||
+                0
+              ) + 1;
+          }
+
+          const controlTotal =
+            stats(
+              enriched,
+              controlRisk
+            );
+
+          const variantTotal =
+            stats(
+              enriched,
+              variantRisk
+            );
+
+          const confirmedStats =
+            stats(
+              newlyConfirmed,
+              variantRisk
+            );
+
+          const result = {
+            version:
+              "V4_CONFIRMED_SAME_SQUAD_AB_1",
+
+            mode:
+              "HISTORICAL_REPLAY_ONLY",
+
+            safety: {
+              strategyFilesModified:
+                false,
+
+              scannerEnabled:
+                false,
+
+              paperOrdersEnabled:
+                false,
+
+              realOrdersEnabled:
+                false,
+
+              orderEndpointsUsed:
+                false,
+            },
+
+            question:
+              "On the exact same control entries, does labeling qualifying BREAKOUT/RETEST setups as CONFIRMED via rr2 improve risk allocation?",
+
+            isolatedChange:
+              "Classification/risk tier only. Entry, stop, TP geometry, timestamps, outcomes and control cooldown population are frozen.",
+
+            dataset:
+              replaySummary
+                .dataset ??
+              null,
+
+            replayWindow:
+              replaySummary
+                .replayWindow ??
+              null,
+
+            integrity: {
+              sameSquad,
+
+              exactSameEntries:
+                signals.length,
+
+              controlPopulationFrozenBeforeVariantClassification:
+                true,
+
+              noVariantCooldownContamination:
+                true,
+            },
+
+            transitions,
+
+            control:
+              controlTotal,
+
+            variantSameSquad:
+              variantTotal,
+
+            newlyConfirmed: {
+              count:
+                newlyConfirmed.length,
+
+              performance:
+                confirmedStats,
+
+              bySymbol:
+                group(
+                  newlyConfirmed,
+                  (e) =>
+                    e.symbol,
+                  variantRisk
+                ),
+
+              byDirection:
+                group(
+                  newlyConfirmed,
+                  (e) =>
+                    e.direction,
+                  variantRisk
+                ),
+            },
+
+            unchangedStarter:
+              stats(
+                unchangedStarter,
+                variantRisk
+              ),
+
+            delta: {
+              weightedGrossRiskUnits:
+                round(
+                  (
+                    variantTotal
+                      .weightedGrossRiskUnits ??
+                    0
+                  ) -
+                  (
+                    controlTotal
+                      .weightedGrossRiskUnits ??
+                    0
+                  ),
+                  4
+                ),
+
+              weightedMaxDrawdownRiskUnits:
+                round(
+                  (
+                    variantTotal
+                      .weightedMaxDrawdownRiskUnits ??
+                    0
+                  ) -
+                  (
+                    controlTotal
+                      .weightedMaxDrawdownRiskUnits ??
+                    0
+                  ),
+                  4
+                ),
+            },
+
+            interpretationGuardrails: [
+              "Raw-R total is intentionally identical because the same exact entries and outcomes are compared.",
+              "The useful test is whether the subset promoted to CONFIRMED deserves 0.50R instead of STARTER sizing.",
+              "Variant-only opportunities that were WATCH in control are excluded from this same-squad test and can be tested separately later.",
+              "This is not an account-equity portfolio simulation; overlap, correlation, fees and slippage are not modeled.",
+              "Binance historical volume remains a proxy; DOGE normalized-volume proxy was not validated at the preregistered threshold.",
+              "No PAPER or LIVE permission is granted by this test."
+            ],
+          };
+
+          if (!sameSquad) {
+            throw new Error(
+              "Same-squad integrity failed"
+            );
+          }
+
+          if (
+            controlTotal.signals !==
+            variantTotal.signals
+          ) {
+            throw new Error(
+              "A/B signal counts differ"
+            );
+          }
+
+          if (
+            controlTotal.grossR !==
+            variantTotal.grossR
+          ) {
+            throw new Error(
+              "Raw-R changed despite same entries"
+            );
+          }
+
+          await writeFile(
+            "artifacts_ab/v4_confirmed_same_squad_ab_summary.json",
+            JSON.stringify(
+              result,
+              null,
+              2
+            ),
+            "utf8"
+          );
+
+          await writeFile(
+            "artifacts_ab/v4_confirmed_same_squad_events.json",
+            JSON.stringify(
+              enriched,
+              null,
+              2
+            ),
+            "utf8"
+          );
+
+          console.log(
+            "===== V4 CONFIRMED SAME-SQUAD A/B ====="
+          );
+
+          console.log(
+            JSON.stringify(
+              result,
+              null,
+              2
+            )
+          );
+          NODE
+
+      - name: Show Same-Squad Result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f artifacts_ab/v4_confirmed_same_squad_ab_summary.json ]; then
+            cat artifacts_ab/v4_confirmed_same_squad_ab_summary.json
+          else
+            echo "Same-squad A/B summary was not generated."
+          fi
+
+      - name: Upload Same-Squad Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-confirmed-same-squad-ab-results
+          path: |
+            artifacts_ab/v4_confirmed_same_squad_ab_summary.json
+            artifacts_ab/v4_confirmed_same_squad_events.json
+            artifacts/v4_replay_summary.json
+            artifacts/v4_replay_signals.json
+            artifacts/v4_replay_signals.csv
+          if-no-files-found: warn
+          retention-days: 30
