@@ -1,0 +1,4 @@
+# Trigger only. Upload this LAST after the provider, harness and workflow exist.
+# V4 FROZEN 100D CONTROL REPLAY
+# HISTORICAL ONLY — NO PAPER / NO LIVE / NO ORDERS
+label=core6_frozen_100d_control_replay_v1
