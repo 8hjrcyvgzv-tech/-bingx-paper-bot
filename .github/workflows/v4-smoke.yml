@@ -1,0 +1,36 @@
+name: V4 Clean Core Smoke Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v4-clean-core
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Compile V4 Worker
+        run: >
+          npx wrangler deploy
+          worker_v4_clean_core.js
+          --dry-run
+          --name v4-clean-core-smoke
+          --compatibility-date 2026-08-28
+
+      - name: Safety Lock Check
+        run: |
+          grep -q 'realOrdersEnabled: false' worker_v4_clean_core.js
+          grep -q 'paperOrdersEnabled: false' worker_v4_clean_core.js
+          grep -q 'scannerEnabled: false' worker_v4_clean_core.js
+          grep -q 'realOrderPermission: false' worker_v4_clean_core.js
+          echo "V4 SAFETY LOCK: PASS"
