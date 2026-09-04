@@ -1,8 +1,8 @@
 # Edit values below to intentionally launch a V4 replay on v4-clean-core.
 # Normal V4 code commits do NOT trigger replay.
 symbols=BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
-days=30
+days=60
 step_minutes=15
 outcome_hours=24
 signal_cooldown_hours=6
-label=core6_30d_integrated_context
+label=core6_60d_validation
