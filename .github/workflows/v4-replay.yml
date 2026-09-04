@@ -1,0 +1,79 @@
+name: V4 Tiberius Replay Lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Symbols"
+        required: true
+        default: "BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT"
+
+      days:
+        description: "Replay days"
+        required: true
+        default: "30"
+
+      step_minutes:
+        description: "Replay step minutes"
+        required: true
+        default: "15"
+
+      outcome_hours:
+        description: "Outcome horizon hours"
+        required: true
+        default: "24"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Safety Check
+        run: |
+          grep -q 'realOrdersEnabled: false' worker_v4_clean_core.js
+          grep -q 'paperOrdersEnabled: false' worker_v4_clean_core.js
+          grep -q 'realOrderPermission: false' worker_v4_clean_core.js
+          echo "V4 REPLAY SAFETY: PASS"
+
+      - name: Run Tiberius Replay
+        env:
+          REPLAY_SYMBOLS: ${{ inputs.symbols }}
+          REPLAY_DAYS: ${{ inputs.days }}
+          REPLAY_STEP_MIN: ${{ inputs.step_minutes }}
+          REPLAY_OUTCOME_HOURS: ${{ inputs.outcome_hours }}
+        run: |
+          node v4_replay_runner.mjs
+
+      - name: Show Replay Summary
+        if: always()
+        run: |
+          if [ -f artifacts/v4_replay_summary.json ]; then
+            echo "===== V4 REPLAY SUMMARY ====="
+            cat artifacts/v4_replay_summary.json
+          else
+            echo "Replay summary was not generated."
+          fi
+
+      - name: Upload Replay Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-replay-results
+          path: |
+            artifacts/v4_replay_summary.json
+            artifacts/v4_replay_signals.json
+            artifacts/v4_replay_signals.csv
+          if-no-files-found: warn
+          retention-days: 30
