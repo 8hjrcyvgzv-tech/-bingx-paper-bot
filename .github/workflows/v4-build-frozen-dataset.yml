@@ -1,0 +1,72 @@
+name: V4 Build Frozen 200D Dataset
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - v4-clean-core
+    paths:
+      - "v4_build_frozen_dataset_trigger.txt"
+      - ".github/workflows/v4-build-frozen-dataset.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          test -f v4_build_frozen_dataset.py
+          python -m py_compile v4_build_frozen_dataset.py
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' v4_build_frozen_dataset.py
+          echo "V4 FROZEN DATASET SAFETY: READ-ONLY PASS"
+
+      - name: Build Frozen Dataset
+        run: |
+          python v4_build_frozen_dataset.py
+
+      - name: Show Build Summary
+        if: always()
+        run: |
+          if [ -f frozen_dataset/build_summary.json ]; then
+            echo "===== V4 FROZEN DATASET BUILD SUMMARY ====="
+            cat frozen_dataset/build_summary.json
+          else
+            echo "Build summary was not generated."
+          fi
+
+      - name: Show Manifest Head
+        if: always()
+        run: |
+          if [ -f frozen_dataset/manifest.json ]; then
+            echo "===== V4 FROZEN DATASET MANIFEST ====="
+            cat frozen_dataset/manifest.json
+          else
+            echo "Manifest was not generated."
+          fi
+
+      - name: Upload Frozen Dataset
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-frozen-core6-200d-dataset
+          path: |
+            frozen_dataset/manifest.json
+            frozen_dataset/build_summary.json
+            frozen_dataset/data/*.csv.gz
+          if-no-files-found: warn
+          retention-days: 30
