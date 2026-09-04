@@ -1,0 +1,4 @@
+# Editing this file intentionally launches the V4 frozen historical dataset build.
+# READ-ONLY HISTORICAL DATA BUILD ONLY.
+# NO PAPER / NO LIVE / NO ORDERS.
+label=core6_binance_usdm_5m_100warmup_100replay_1tail_v1
