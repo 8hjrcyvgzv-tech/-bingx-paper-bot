@@ -23,9 +23,12 @@ on:
         required: true
         default: "24"
 
-  push:
+     push:
     branches:
       - v4-clean-core
+    paths:
+      - "v4_replay_trigger.txt"
+      - ".github/workflows/v4-replay.yml" 
 
 jobs:
   replay:
