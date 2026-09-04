@@ -6,6 +6,7 @@
 // 2) Build a temporary replay-only copy.
 // 3) Expose raw execution geometry to avoid 2-decimal distortion.
 // 4) Fix replay outcome timestamp to use timestampMs, not ISO text.
+// 5) Use conservative BingX pagination and fail on incomplete/gapped replay data.
 //
 // This file never calls an order endpoint.
 
@@ -110,7 +111,7 @@ async function patchReplayRunner() {
 
   const timestampNeedle = `  const {\n    timestamp,\n    direction,\n    entry,\n    stop,\n    tp1,\n    tp2,\n  } = signal;`;
 
-  const timestampReplacement = `  const {\n    timestampMs,\n    direction,\n    entry,\n    stop,\n    tp1,\n    tp2,\n  } = signal;\n\n  const timestamp =\n    Number(timestampMs);\n\n  if (!Number.isFinite(timestamp)) {\n    return {\n      outcome:\n        \"INVALID_TIMESTAMP\",\n\n      resultR:\n        null,\n    };\n  }`;
+  const timestampReplacement = `  const {\n    timestampMs,\n    direction,\n    entry,\n    stop,\n    tp1,\n    tp2,\n  } = signal;\n\n  const timestamp =\n    Number(timestampMs);\n\n  if (!Number.isFinite(timestamp)) {\n    return {\n      outcome:\n        "INVALID_TIMESTAMP",\n\n      resultR:\n        null,\n    };\n  }`;
 
   source =
     replaceOnce(
@@ -132,16 +133,30 @@ async function patchReplayRunner() {
       "raw replay geometry consumption"
     );
 
-  const mainNeedle = `main().catch(
-  (error) => {
-    console.error(
-      "V4 REPLAY FATAL:",
-      error
+  // BingX documents max 1440, but replay evidence showed silent partial
+  // low-timeframe coverage with 1440-sized historical windows.
+  // Use the documented default-sized 500-candle chunks for replay safety.
+  source =
+    replaceOnce(
+      source,
+      `  const maxRows = 1440;`,
+      `  const maxRows = 500;`,
+      "conservative kline pagination"
     );
 
-    process.exitCode = 1;
-  }
-);`;
+  const returnNeedle = `  return [\n    ...dedupe.values(),\n  ].sort(\n    (a, b) =>\n      a.openTime -\n      b.openTime\n  );`;
+
+  const returnReplacement = `  const output = [\n    ...dedupe.values(),\n  ].sort(\n    (a, b) =>\n      a.openTime -\n      b.openTime\n  );\n\n  // Replay integrity gate: never silently call a partial history a\n  // 60d/100d test. A few boundary bars are tolerated; large gaps fail.\n  const expectedBars =\n    Math.max(\n      1,\n      Math.floor(\n        (endTime - startTime) /\n          intervalMs\n      ) + 1\n    );\n\n  const coverage =\n    output.length /\n    expectedBars;\n\n  let maxGapMs = 0;\n\n  for (\n    let i = 1;\n    i < output.length;\n    i++\n  ) {\n    maxGapMs =\n      Math.max(\n        maxGapMs,\n        output[i].openTime -\n          output[i - 1].openTime\n      );\n  }\n\n  console.log(\n    \`[COVERAGE] \${symbol} \${interval} rows=\${output.length} expected≈\${expectedBars} coverage=\${round(coverage * 100, 2)}% maxGapMin=\${round(maxGapMs / MINUTE, 2)}\`\n  );\n\n  if (coverage < 0.97) {\n    throw new Error(\n      \`Replay data incomplete for \${symbol} \${interval}: \${round(coverage * 100, 2)}% coverage (\${output.length}/\${expectedBars})\`\n    );\n  }\n\n  if (\n    output.length > 1 &&\n    maxGapMs >\n      intervalMs * 3\n  ) {\n    throw new Error(\n      \`Replay data gap too large for \${symbol} \${interval}: \${round(maxGapMs / MINUTE, 2)} minutes\`\n    );\n  }\n\n  return output;`;
+
+  source =
+    replaceOnce(
+      source,
+      returnNeedle,
+      returnReplacement,
+      "replay data integrity gate"
+    );
+
+  const mainNeedle = `main().catch(\n  (error) => {\n    console.error(\n      "V4 REPLAY FATAL:",\n      error\n    );\n\n    process.exitCode = 1;\n  }\n);`;
 
   const mainReplacement = `await main();`;
 
@@ -162,7 +177,7 @@ async function patchReplayRunner() {
 
 async function main() {
   console.log(
-    "V4 REPLAY HARNESS: preparing precision-safe replay copy"
+    "V4 REPLAY HARNESS: preparing precision + data-integrity safe replay copy"
   );
 
   await prepareTempTree();
@@ -170,7 +185,7 @@ async function main() {
   await patchReplayRunner();
 
   console.log(
-    "V4 REPLAY HARNESS: timestamp + raw geometry patches PASS"
+    "V4 REPLAY HARNESS: timestamp + raw geometry + pagination + coverage patches PASS"
   );
 
   const runnerUrl =
