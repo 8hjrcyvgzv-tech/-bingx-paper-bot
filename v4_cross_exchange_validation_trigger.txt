@@ -1,0 +1,3 @@
+# Editing this file intentionally launches V4 cross-exchange historical validation.
+# TEST / READ-ONLY ONLY. No PAPER or LIVE orders.
+label=bingx_vs_binance_30d_5m_validation_v1
