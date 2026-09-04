@@ -1,0 +1,61 @@
+name: V4 Cross Exchange Validation
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - v4-clean-core
+
+    paths:
+      - "v4_cross_exchange_validation_trigger.txt"
+      - ".github/workflows/v4-cross-exchange-validation.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          test -f v4_cross_exchange_validation.mjs
+          ! grep -Eq '/trade/order|/trade/batchOrders|method:[[:space:]]*"POST"|method:[[:space:]]*"DELETE"|method:[[:space:]]*"PUT"' v4_cross_exchange_validation.mjs
+          echo "V4 CROSS-EXCHANGE SAFETY: READ-ONLY PASS"
+
+      - name: Run Cross Exchange Validation
+        run: |
+          node v4_cross_exchange_validation.mjs
+
+      - name: Show Validation Summary
+        if: always()
+        run: |
+          if [ -f artifacts/v4_cross_exchange_validation_summary.json ]; then
+            echo "===== V4 CROSS-EXCHANGE VALIDATION SUMMARY ====="
+            cat artifacts/v4_cross_exchange_validation_summary.json
+          else
+            echo "Validation summary was not generated."
+          fi
+
+      - name: Upload Validation Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-cross-exchange-validation-results
+          path: |
+            artifacts/v4_cross_exchange_validation_summary.json
+            artifacts/v4_cross_exchange_validation.csv
+          if-no-files-found: warn
+          retention-days: 30
