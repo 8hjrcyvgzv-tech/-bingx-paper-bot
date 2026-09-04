@@ -23,17 +23,23 @@ import {
 } from "./v4_flow.js";
 
 import {
+  analyzeV4Catalyst,
+  V4_CATALYST_VERSION,
+} from "./v4_catalyst.js";
+
+import {
   analyzeV4Execution,
   V4_EXECUTION_VERSION,
 } from "./v4_execution.js";
 
-const VERSION = "V4_CLEAN_CORE_INTEGRATED_1";
+const VERSION = "V4_CLEAN_CORE_INTEGRATED_2";
 
 const TEAM = {
   RADAR: "BELIT",
   DIRECTION: "EMRE",
   STRUCTURE: "AKSEL",
   FLOW: "DORUK",
+  CATALYST: "NEXUS",
   EXECUTION: "MR_TRADER",
   PERFORMANCE: "TIBERIUS",
 };
@@ -49,6 +55,10 @@ const CORE5 = [
 function num(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
 }
 
 function round2(v) {
@@ -88,7 +98,8 @@ function normalizeCandles(rows) {
 }
 
 function atr(rows, period = 14) {
-  const candles = normalizeCandles(rows);
+  const candles =
+    normalizeCandles(rows);
 
   if (candles.length <= period) {
     return null;
@@ -258,6 +269,113 @@ function fallbackStop(
   );
 }
 
+function buildContextFlow(
+  flow = {},
+  catalyst = {}
+) {
+  const rawFlowScore =
+    clamp(
+      num(flow?.score) ?? 5,
+      0,
+      10
+    );
+
+  const pressureScore =
+    clamp(
+      num(
+        flow?.directionalPressureScore
+      ) ?? 5,
+      0,
+      10
+    );
+
+  const flowCoverage =
+    clamp(
+      num(flow?.coverage) ?? 0,
+      0,
+      1
+    );
+
+  // FLOW_2 begins as a conservative blend.
+  // Missing data stays neutral instead of becoming bearish.
+  const pressureWeight =
+    flowCoverage >= 0.30
+      ? 0.35
+      : 0.15;
+
+  let contextScore =
+    rawFlowScore *
+      (1 - pressureWeight) +
+    pressureScore *
+      pressureWeight;
+
+  const catalystScore =
+    clamp(
+      num(catalyst?.score) ?? 5,
+      0,
+      10
+    );
+
+  const catalystCoverage =
+    clamp(
+      num(catalyst?.coverage) ?? 0,
+      0,
+      1
+    );
+
+  // Catalyst stays a score/context layer, never a hard veto.
+  const catalystWeight =
+    catalystCoverage > 0
+      ? Math.min(
+          0.20,
+          0.08 +
+            catalystCoverage * 0.12
+        )
+      : 0;
+
+  contextScore =
+    contextScore *
+      (1 - catalystWeight) +
+    catalystScore *
+      catalystWeight;
+
+  return {
+    ...flow,
+
+    score:
+      round2(
+        clamp(
+          contextScore,
+          0,
+          10
+        )
+      ),
+
+    rawFlowScore:
+      round2(rawFlowScore),
+
+    pressureScore:
+      round2(pressureScore),
+
+    catalystScore:
+      round2(catalystScore),
+
+    blend: {
+      pressureWeight:
+        round2(pressureWeight),
+
+      catalystWeight:
+        round2(catalystWeight),
+
+      flowCoverage:
+        round2(flowCoverage),
+
+      catalystCoverage:
+        round2(catalystCoverage),
+    },
+  };
+}
+
 function systemInfo() {
   return {
     version: VERSION,
@@ -270,6 +388,7 @@ function systemInfo() {
       "DIRECTION",
       "STRUCTURE",
       "FLOW",
+      "CATALYST",
       "EXECUTION",
     ],
 
@@ -285,6 +404,9 @@ function systemInfo() {
 
       flow:
         V4_FLOW_VERSION,
+
+      catalyst:
+        V4_CATALYST_VERSION,
 
       execution:
         V4_EXECUTION_VERSION,
@@ -426,7 +548,31 @@ export function runV4CleanCore(
         input?.nowTs,
     });
 
-  // 5 — MR TRADER / EXECUTION
+  // 5 — NEXUS / CATALYST
+  const catalyst =
+    analyzeV4Catalyst({
+      symbol,
+
+      direction:
+        selectedDirection,
+
+      catalysts:
+        input?.catalysts ??
+        input?.news,
+
+      nowTs:
+        input?.nowTs,
+    });
+
+  // FLOW_2 + CATALYST are introduced conservatively
+  // through context score, not hard veto.
+  const contextFlow =
+    buildContextFlow(
+      flow,
+      catalyst
+    );
+
+  // 6 — MR TRADER / EXECUTION
   const entry =
     latestPrice(input);
 
@@ -477,7 +623,8 @@ export function runV4CleanCore(
 
       structure,
 
-      flow,
+      flow:
+        contextFlow,
     });
 
   return {
@@ -492,6 +639,8 @@ export function runV4CleanCore(
       direction,
       structure,
       flow,
+      catalyst,
+      contextFlow,
       execution,
     },
 
@@ -503,6 +652,26 @@ export function runV4CleanCore(
       finalScore:
         execution?.finalScore ??
         0,
+
+      contextFlowScore:
+        contextFlow?.score ??
+        5,
+
+      catalystStatus:
+        catalyst?.status ??
+        "NEUTRAL",
+
+      demandScore:
+        flow?.demandScore ??
+        null,
+
+      supplyScore:
+        flow?.supplyScore ??
+        null,
+
+      dominantSide:
+        flow?.dominantSide ??
+        "BALANCED",
 
       entry:
         execution?.entry ??
@@ -646,9 +815,8 @@ export default {
   },
 
   async scheduled() {
-    // Bilerek NO-OP.
-    // Replay + smoke test bitmeden
-    // piyasa taraması veya emir yok.
+    // Deliberate NO-OP.
+    // Replay + smoke must validate V4 before scanner/PAPER.
     console.log(
       JSON.stringify({
         ...systemInfo(),
