@@ -19,13 +19,22 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Create isolated V4 config
+        run: |
+          cat > wrangler.v4-smoke.jsonc <<'EOF'
+          {
+            "name": "v4-clean-core-smoke",
+            "main": "worker_v4_clean_core.js",
+            "compatibility_date": "2026-08-28"
+          }
+          EOF
+
       - name: Compile V4 Worker
         run: >
-          npx wrangler deploy
-          worker_v4_clean_core.js
+          npx --yes wrangler@4
+          deploy
           --dry-run
-          --name v4-clean-core-smoke
-          --compatibility-date 2026-08-28
+          --config wrangler.v4-smoke.jsonc
 
       - name: Safety Lock Check
         run: |
