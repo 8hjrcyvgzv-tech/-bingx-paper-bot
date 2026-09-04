@@ -1,0 +1,3 @@
+# Editing this file intentionally launches the V4 BingX historical data probe.
+# TEST / READ-ONLY ONLY. No PAPER or LIVE orders.
+label=bingx_5m_history_probe_v1
