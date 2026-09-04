@@ -5,4 +5,4 @@ days=100
 step_minutes=15
 outcome_hours=24
 signal_cooldown_hours=6
-label=core6_100d_validation
+label=core6_100d_integrity_validation
