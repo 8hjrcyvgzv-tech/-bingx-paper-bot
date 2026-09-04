@@ -14,7 +14,7 @@
 // Neutral flow score = 5/10.
 // Strong evidence moves the score above/below neutral.
 
-export const V4_FLOW_VERSION = "V4_FLOW_1";
+export const V4_FLOW_VERSION = "V4_FLOW_2";
 
 export const V4_FLOW_CFG = {
   neutralScore: 5.0,
@@ -32,9 +32,21 @@ export const V4_FLOW_CFG = {
   fundingCrowded: 0.0005,
   fundingExtreme: 0.0010,
 
-  liquidationRatio: 1.50,
+    liquidationRatio: 1.50,
 
   minUsefulCoverage: 0.30,
+
+  // FLOW_2 — directional pressure
+  pressureNeutralScore: 5.0,
+  pressureStrongScore: 7.0,
+  pressureDominantScore: 8.0,
+
+  spotPressureWeight: 1.40,
+  futuresPressureWeight: 0.80,
+  oiPressureWeight: 0.60,
+  liquidationPressureWeight: 0.40,
+
+  leveragePressurePenalty: 1.00,
 };
 
 function num(v) {
@@ -247,7 +259,381 @@ function directionalSign(
 
   return null;
 }
+// ---------------------------------
+// FLOW_2 — DEMAND / SUPPLY PRESSURE
+// ---------------------------------
+function pressureAlignment(
+  delta15,
+  delta60,
+  direction
+) {
+  const aligned15 =
+    directionalSign(
+      delta15,
+      direction
+    );
 
+  const aligned60 =
+    directionalSign(
+      delta60,
+      direction
+    );
+
+  if (
+    aligned15 === true &&
+    aligned60 === true
+  ) {
+    return 1.0;
+  }
+
+  if (
+    aligned15 === true ||
+    aligned60 === true
+  ) {
+    return 0.5;
+  }
+
+  if (
+    aligned15 === false &&
+    aligned60 === false
+  ) {
+    return -1.0;
+  }
+
+  if (
+    aligned15 === false ||
+    aligned60 === false
+  ) {
+    return -0.5;
+  }
+
+  return 0;
+}
+
+function directionalPressureScore(
+  direction,
+  {
+    spot15,
+    spot60,
+    futures15,
+    futures60,
+    oi15,
+    oi60,
+    price15,
+    price60,
+    liquidation,
+  }
+) {
+  let score =
+    V4_FLOW_CFG.pressureNeutralScore;
+
+  const reasons = [];
+  const warnings = [];
+
+  // -----------------------------
+  // SPOT PRESSURE
+  // -----------------------------
+
+  const spotPressure =
+    pressureAlignment(
+      spot15,
+      spot60,
+      direction
+    );
+
+  score +=
+    spotPressure *
+    V4_FLOW_CFG.spotPressureWeight;
+
+  if (spotPressure >= 1) {
+    reasons.push(
+      direction === "LONG"
+        ? "strong spot demand"
+        : "strong spot supply"
+    );
+  } else if (spotPressure > 0) {
+    reasons.push(
+      direction === "LONG"
+        ? "partial spot demand"
+        : "partial spot supply"
+    );
+  }
+
+  // -----------------------------
+  // FUTURES PRESSURE
+  // -----------------------------
+
+  const futuresPressure =
+    pressureAlignment(
+      futures15,
+      futures60,
+      direction
+    );
+
+  score +=
+    futuresPressure *
+    V4_FLOW_CFG.futuresPressureWeight;
+
+  if (futuresPressure >= 1) {
+    reasons.push(
+      direction === "LONG"
+        ? "futures buying pressure"
+        : "futures selling pressure"
+    );
+  }
+
+  // -----------------------------
+  // OPEN INTEREST
+  // -----------------------------
+
+  const priceAligned15 =
+    directionalSign(
+      price15,
+      direction
+    );
+
+  const priceAligned60 =
+    directionalSign(
+      price60,
+      direction
+    );
+
+  let oiPressure = 0;
+
+  if (
+    priceAligned60 === true &&
+    oi60 !== null &&
+    oi60 >=
+      V4_FLOW_CFG.oi60SupportPct
+  ) {
+    oiPressure = 1.0;
+  } else if (
+    priceAligned15 === true &&
+    oi15 !== null &&
+    oi15 >=
+      V4_FLOW_CFG.oi15SupportPct
+  ) {
+    oiPressure = 0.5;
+  }
+
+  if (
+    priceAligned60 === false &&
+    oi60 !== null &&
+    oi60 >=
+      V4_FLOW_CFG.oi60StrongPct
+  ) {
+    oiPressure = -1.0;
+
+    warnings.push(
+      "OI expands against pressure direction"
+    );
+  }
+
+  score +=
+    oiPressure *
+    V4_FLOW_CFG.oiPressureWeight;
+
+  if (oiPressure > 0) {
+    reasons.push(
+      "fresh OI supports pressure"
+    );
+  }
+
+  // -----------------------------
+  // LIQUIDATION PRESSURE
+  // -----------------------------
+
+  let liquidationPressure = 0;
+
+  const supportingLiquidations =
+    direction === "LONG"
+      ? liquidation?.shortUsd ?? 0
+      : liquidation?.longUsd ?? 0;
+
+  const opposingLiquidations =
+    direction === "LONG"
+      ? liquidation?.longUsd ?? 0
+      : liquidation?.shortUsd ?? 0;
+
+  const liquidationRatio =
+    supportingLiquidations /
+    Math.max(
+      opposingLiquidations,
+      1
+    );
+
+  if (
+    supportingLiquidations > 0 &&
+    liquidationRatio >=
+      V4_FLOW_CFG.liquidationRatio
+  ) {
+    liquidationPressure = 1.0;
+
+    reasons.push(
+      direction === "LONG"
+        ? "short squeeze pressure"
+        : "long liquidation pressure"
+    );
+  }
+
+  score +=
+    liquidationPressure *
+    V4_FLOW_CFG
+      .liquidationPressureWeight;
+
+  // -----------------------------
+  // LEVERAGE QUALITY
+  // -----------------------------
+
+  let leverageDriven = false;
+
+  if (
+    futuresPressure > 0 &&
+    spotPressure <= 0
+  ) {
+    score -=
+      V4_FLOW_CFG
+        .leveragePressurePenalty;
+
+    leverageDriven = true;
+
+    warnings.push(
+      "pressure is futures-led without spot confirmation"
+    );
+  }
+
+  score =
+    round2(
+      clamp(
+        score,
+        0,
+        10
+      )
+    );
+
+  return {
+    direction,
+    score,
+
+    spotPressure:
+      round2(spotPressure),
+
+    futuresPressure:
+      round2(futuresPressure),
+
+    oiPressure:
+      round2(oiPressure),
+
+    liquidationPressure:
+      round2(
+        liquidationPressure
+      ),
+
+    leverageDriven,
+
+    reasons:
+      [...new Set(reasons)],
+
+    warnings:
+      [...new Set(warnings)],
+  };
+}
+
+function buildDemandSupplyPressure(
+  data
+) {
+  const demand =
+    directionalPressureScore(
+      "LONG",
+      data
+    );
+
+  const supply =
+    directionalPressureScore(
+      "SHORT",
+      data
+    );
+
+  const demandScore =
+    demand.score;
+
+  const supplyScore =
+    supply.score;
+
+  const netPressure =
+    round2(
+      demandScore -
+      supplyScore
+    );
+
+  let dominantSide =
+    "BALANCED";
+
+  let pressureStrength =
+    "NEUTRAL";
+
+  if (
+    demandScore >=
+      V4_FLOW_CFG
+        .pressureStrongScore &&
+    demandScore > supplyScore
+  ) {
+    dominantSide =
+      "DEMAND";
+
+    pressureStrength =
+      "STRONG";
+  }
+
+  if (
+    supplyScore >=
+      V4_FLOW_CFG
+        .pressureStrongScore &&
+    supplyScore > demandScore
+  ) {
+    dominantSide =
+      "SUPPLY";
+
+    pressureStrength =
+      "STRONG";
+  }
+
+  if (
+    demandScore >=
+      V4_FLOW_CFG
+        .pressureDominantScore &&
+    demandScore > supplyScore
+  ) {
+    dominantSide =
+      "DEMAND";
+
+    pressureStrength =
+      "DOMINANT";
+  }
+
+  if (
+    supplyScore >=
+      V4_FLOW_CFG
+        .pressureDominantScore &&
+    supplyScore > demandScore
+  ) {
+    dominantSide =
+      "SUPPLY";
+
+    pressureStrength =
+      "DOMINANT";
+  }
+
+  return {
+    demandScore,
+    supplyScore,
+    netPressure,
+    dominantSide,
+    pressureStrength,
+    demand,
+    supply,
+  };
+}
 function normalizeFundingRate(value) {
   const v = num(value);
 
@@ -670,7 +1056,27 @@ export function analyzeV4Flow(
       nowTs,
       60
     );
+  // -----------------------------
+  // FLOW_2 — DEMAND / SUPPLY
+  // -----------------------------
 
+  const pressure =
+    buildDemandSupplyPressure({
+      spot15,
+      spot60,
+      futures15,
+      futures60,
+      oi15,
+      oi60,
+      price15,
+      price60,
+      liquidation,
+    });
+
+  const directionalPressure =
+    direction === "LONG"
+      ? pressure.demand
+      : pressure.supply;
   let score =
     V4_FLOW_CFG.neutralScore;
 
@@ -974,7 +1380,26 @@ export function analyzeV4Flow(
 
     score,
     status,
+    // FLOW_2 — two-sided pressure
+    demandScore:
+      pressure.demandScore,
 
+    supplyScore:
+      pressure.supplyScore,
+
+    netPressure:
+      pressure.netPressure,
+
+    dominantSide:
+      pressure.dominantSide,
+
+    pressureStrength:
+      pressure.pressureStrength,
+
+    directionalPressureScore:
+      directionalPressure.score,
+
+    directionalPressure,
     coverage:
       round2(coverage),
 
