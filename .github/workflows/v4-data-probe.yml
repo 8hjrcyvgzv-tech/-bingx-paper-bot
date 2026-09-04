@@ -1,0 +1,60 @@
+name: V4 BingX Data Probe
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - v4-clean-core
+    paths:
+      - "v4_data_probe_trigger.txt"
+      - ".github/workflows/v4-data-probe.yml"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          test -f v4_data_probe.mjs
+          ! grep -Eq '/trade/order|/trade/batchOrders|method:[[:space:]]*"POST"|method:[[:space:]]*"DELETE"|method:[[:space:]]*"PUT"' v4_data_probe.mjs
+          echo "V4 DATA PROBE SAFETY: READ-ONLY PASS"
+
+      - name: Run BingX Historical Data Probe
+        run: |
+          node v4_data_probe.mjs
+
+      - name: Show Probe Summary
+        if: always()
+        run: |
+          if [ -f artifacts/v4_data_probe_summary.json ]; then
+            echo "===== V4 DATA PROBE SUMMARY ====="
+            cat artifacts/v4_data_probe_summary.json
+          else
+            echo "Probe summary was not generated."
+          fi
+
+      - name: Upload Probe Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-data-probe-results
+          path: |
+            artifacts/v4_data_probe_summary.json
+            artifacts/v4_data_probe_checks.csv
+          if-no-files-found: warn
+          retention-days: 30
