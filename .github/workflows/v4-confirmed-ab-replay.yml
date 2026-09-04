@@ -1,0 +1,921 @@
+name: V4 Confirmed Gate A-B Replay
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - v4-clean-core
+    paths:
+      - ".github/workflows/v4-confirmed-ab-replay.yml"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      V4_FROZEN_DATASET_ID: V4_CORE6_BINANCE_UM_5M_20260215_20260903_EBECBEDEEE03
+      V4_FROZEN_ROOT_SHA256: ebecbedeee03954dc9a8ff5fdabf764ebf92fb8cd90b30a659f8cbeaf9d67965
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download Frozen Dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: v4-frozen-core6-200d-dataset
+          path: frozen_dataset
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33924848219
+
+      - name: Safety and Syntax Check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f v4_frozen_replay_harness.mjs
+          test -f v4_frozen_data_provider.mjs
+          test -f v4_replay_runner.mjs
+          test -f v4_execution.js
+          test -f v4_logic_test.mjs
+          test -f frozen_dataset/manifest.json
+          test -f frozen_dataset/data/BTC_USDT_5m.csv.gz
+
+          node --check v4_frozen_replay_harness.mjs
+          node --check v4_frozen_data_provider.mjs
+          node --check v4_execution.js
+
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' \
+            v4_frozen_replay_harness.mjs \
+            v4_frozen_data_provider.mjs
+
+          echo "V4 CONFIRMED A/B SAFETY: HISTORICAL READ-ONLY PASS"
+
+      - name: Logic Test
+        run: |
+          node v4_logic_test.mjs
+
+      - name: Run Control — Current RR1 Gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf artifacts artifacts_ab
+          node v4_frozen_replay_harness.mjs
+
+          mkdir -p artifacts_ab/control
+
+          cp artifacts/v4_replay_summary.json \
+             artifacts_ab/control/v4_replay_summary.json
+
+          cp artifacts/v4_replay_signals.json \
+             artifacts_ab/control/v4_replay_signals.json
+
+          cp artifacts/v4_replay_signals.csv \
+             artifacts_ab/control/v4_replay_signals.csv
+
+          echo "CONTROL COMPLETE: current rr1 >= minConfirmedRR gate"
+
+      - name: Apply Replay-Only Variant B — RR2 Confirm Gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node --input-type=module <<'NODE'
+          import {
+            readFile,
+            writeFile,
+          } from "node:fs/promises";
+
+          const path =
+            "v4_execution.js";
+
+          let source =
+            await readFile(
+              path,
+              "utf8"
+            );
+
+          const oldBlock =
+          `      rr1 !== null &&
+                rr1 >=
+                  V4_EXECUTION_CFG.minConfirmedRR &&`;
+
+          const newBlock =
+          `      rr2 !== null &&
+                rr2 >=
+                  V4_EXECUTION_CFG.minConfirmedRR &&`;
+
+          const count =
+            source.split(
+              oldBlock
+            ).length - 1;
+
+          if (count !== 1) {
+            throw new Error(
+              `Expected exactly one CONFIRMED rr1 gate, found ${count}`
+            );
+          }
+
+          source =
+            source.replace(
+              oldBlock,
+              newBlock
+            );
+
+          await writeFile(
+            path,
+            source,
+            "utf8"
+          );
+
+          console.log(
+            "VARIANT B PATCH PASS: CONFIRMED gate rr1 -> rr2"
+          );
+          NODE
+
+          git diff --check
+          git diff -- v4_execution.js
+
+      - name: Run Variant B — RR2 Confirm Gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf artifacts
+          node v4_frozen_replay_harness.mjs
+
+          mkdir -p artifacts_ab/variant_rr2
+
+          cp artifacts/v4_replay_summary.json \
+             artifacts_ab/variant_rr2/v4_replay_summary.json
+
+          cp artifacts/v4_replay_signals.json \
+             artifacts_ab/variant_rr2/v4_replay_signals.json
+
+          cp artifacts/v4_replay_signals.csv \
+             artifacts_ab/variant_rr2/v4_replay_signals.csv
+
+          echo "VARIANT B COMPLETE: rr2 >= minConfirmedRR gate"
+
+      - name: Restore Production Execution File
+        if: always()
+        shell: bash
+        run: |
+          git checkout -- v4_execution.js
+          git diff --exit-code -- v4_execution.js
+          echo "PRODUCTION FILE RESTORED — REPOSITORY LOGIC UNCHANGED"
+
+      - name: Compare Control vs Variant B
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node --input-type=module <<'NODE'
+          import {
+            readFile,
+            writeFile,
+          } from "node:fs/promises";
+
+          function num(v) {
+            const n = Number(v);
+            return Number.isFinite(n)
+              ? n
+              : null;
+          }
+
+          function round(v, digits = 4) {
+            if (!Number.isFinite(v)) {
+              return null;
+            }
+
+            const m =
+              10 ** digits;
+
+            return (
+              Math.round(
+                v * m
+              ) / m
+            );
+          }
+
+          function keyOf(x) {
+            return [
+              x?.timestampMs ??
+                x?.timestamp,
+              x?.symbol,
+              x?.direction,
+            ].join("|");
+          }
+
+          function maxDrawdown(values) {
+            let equity = 0;
+            let peak = 0;
+            let maxDd = 0;
+
+            for (
+              const value of values
+            ) {
+              if (
+                !Number.isFinite(
+                  value
+                )
+              ) {
+                continue;
+              }
+
+              equity += value;
+
+              peak =
+                Math.max(
+                  peak,
+                  equity
+                );
+
+              maxDd =
+                Math.max(
+                  maxDd,
+                  peak - equity
+                );
+            }
+
+            return maxDd;
+          }
+
+          function riskFactor(event) {
+            if (
+              event?.decision ===
+              "CONFIRMED"
+            ) {
+              return 0.50;
+            }
+
+            if (
+              event?.decision ===
+              "STARTER"
+            ) {
+              return (
+                num(
+                  event?.finalScore
+                ) >= 7.5
+                  ? 0.40
+                  : 0.25
+              );
+            }
+
+            return 0;
+          }
+
+          function stats(events) {
+            const rows =
+              events
+                .map(
+                  (x) => ({
+                    ...x,
+                    resultR:
+                      num(
+                        x?.resultR
+                      ),
+                  })
+                )
+                .filter(
+                  (x) =>
+                    Number.isFinite(
+                      x.resultR
+                    )
+                )
+                .sort(
+                  (a, b) =>
+                    Number(
+                      a?.timestampMs ??
+                        0
+                    ) -
+                    Number(
+                      b?.timestampMs ??
+                        0
+                    )
+                );
+
+            const returns =
+              rows.map(
+                (x) =>
+                  x.resultR
+              );
+
+            const weighted =
+              rows.map(
+                (x) =>
+                  x.resultR *
+                  riskFactor(x)
+              );
+
+            const wins =
+              returns.filter(
+                (x) => x > 0
+              );
+
+            const losses =
+              returns.filter(
+                (x) => x < 0
+              );
+
+            const flats =
+              returns.filter(
+                (x) => x === 0
+              );
+
+            const grossProfit =
+              wins.reduce(
+                (a, b) =>
+                  a + b,
+                0
+              );
+
+            const grossLoss =
+              Math.abs(
+                losses.reduce(
+                  (a, b) =>
+                    a + b,
+                  0
+                )
+              );
+
+            const grossR =
+              returns.reduce(
+                (a, b) =>
+                  a + b,
+                0
+              );
+
+            const paperRiskUnits =
+              weighted.reduce(
+                (a, b) =>
+                  a + b,
+                0
+              );
+
+            return {
+              signals:
+                rows.length,
+
+              wins:
+                wins.length,
+
+              losses:
+                losses.length,
+
+              flats:
+                flats.length,
+
+              winRatePct:
+                rows.length
+                  ? round(
+                      (
+                        wins.length /
+                        rows.length
+                      ) * 100,
+                      2
+                    )
+                  : null,
+
+              expectancyR:
+                rows.length
+                  ? round(
+                      grossR /
+                        rows.length,
+                      4
+                    )
+                  : null,
+
+              profitFactor:
+                grossLoss > 0
+                  ? round(
+                      grossProfit /
+                        grossLoss,
+                      4
+                    )
+                  : null,
+
+              grossR:
+                round(
+                  grossR,
+                  4
+                ),
+
+              maxDrawdownR:
+                round(
+                  maxDrawdown(
+                    returns
+                  ),
+                  4
+                ),
+
+              hypotheticalPaperRiskUnits:
+                round(
+                  paperRiskUnits,
+                  4
+                ),
+
+              averagePaperRiskUnitsPerSignal:
+                rows.length
+                  ? round(
+                      paperRiskUnits /
+                        rows.length,
+                      6
+                    )
+                  : null,
+
+              maxDrawdownPaperRiskUnits:
+                round(
+                  maxDrawdown(
+                    weighted
+                  ),
+                  4
+                ),
+            };
+          }
+
+          function grouped(
+            events,
+            selector
+          ) {
+            const groups =
+              new Map();
+
+            for (
+              const event of events
+            ) {
+              const key =
+                selector(event);
+
+              if (
+                !groups.has(key)
+              ) {
+                groups.set(
+                  key,
+                  []
+                );
+              }
+
+              groups
+                .get(key)
+                .push(event);
+            }
+
+            return (
+              Object.fromEntries(
+                [
+                  ...groups.entries(),
+                ]
+                  .sort(
+                    ([a], [b]) =>
+                      String(a)
+                        .localeCompare(
+                          String(b)
+                        )
+                  )
+                  .map(
+                    ([key, rows]) => [
+                      key,
+                      stats(rows),
+                    ]
+                  )
+              )
+            );
+          }
+
+          async function json(path) {
+            return (
+              JSON.parse(
+                await readFile(
+                  path,
+                  "utf8"
+                )
+              )
+            );
+          }
+
+          const control =
+            await json(
+              "artifacts_ab/control/v4_replay_signals.json"
+            );
+
+          const variant =
+            await json(
+              "artifacts_ab/variant_rr2/v4_replay_signals.json"
+            );
+
+          const controlSummary =
+            await json(
+              "artifacts_ab/control/v4_replay_summary.json"
+            );
+
+          const variantSummary =
+            await json(
+              "artifacts_ab/variant_rr2/v4_replay_summary.json"
+            );
+
+          const controlKeys =
+            control
+              .map(keyOf)
+              .sort();
+
+          const variantKeys =
+            variant
+              .map(keyOf)
+              .sort();
+
+          const sameSignalPopulation =
+            (
+              controlKeys.length ===
+                variantKeys.length &&
+              controlKeys.every(
+                (x, i) =>
+                  x ===
+                  variantKeys[i]
+              )
+            );
+
+          const a =
+            new Map(
+              control.map(
+                (x) => [
+                  keyOf(x),
+                  x,
+                ]
+              )
+            );
+
+          const b =
+            new Map(
+              variant.map(
+                (x) => [
+                  keyOf(x),
+                  x,
+                ]
+              )
+            );
+
+          const transitions = {};
+          const changed = [];
+
+          for (
+            const key of
+            new Set([
+              ...controlKeys,
+              ...variantKeys,
+            ])
+          ) {
+            const left =
+              a.get(key);
+
+            const right =
+              b.get(key);
+
+            const from =
+              left?.decision ??
+              "MISSING";
+
+            const to =
+              right?.decision ??
+              "MISSING";
+
+            const transition =
+              `${from}->${to}`;
+
+            transitions[
+              transition
+            ] =
+              (
+                transitions[
+                  transition
+                ] ??
+                0
+              ) + 1;
+
+            if (
+              from !== to
+            ) {
+              changed.push({
+                key,
+
+                timestamp:
+                  right?.timestamp ??
+                  left?.timestamp ??
+                  null,
+
+                symbol:
+                  right?.symbol ??
+                  left?.symbol ??
+                  null,
+
+                direction:
+                  right?.direction ??
+                  left?.direction ??
+                  null,
+
+                from,
+                to,
+                decision:
+                  to,
+
+                finalScore:
+                  num(
+                    right?.finalScore ??
+                    left?.finalScore
+                  ),
+
+                resultR:
+                  num(
+                    right?.resultR ??
+                    left?.resultR
+                  ),
+              });
+            }
+          }
+
+          const controlConfirmed =
+            control.filter(
+              (x) =>
+                x?.decision ===
+                "CONFIRMED"
+            );
+
+          const variantConfirmed =
+            variant.filter(
+              (x) =>
+                x?.decision ===
+                "CONFIRMED"
+            );
+
+          const variantStarter =
+            variant.filter(
+              (x) =>
+                x?.decision ===
+                "STARTER"
+            );
+
+          const reclassified =
+            changed.filter(
+              (x) =>
+                x.from ===
+                  "STARTER" &&
+                x.to ===
+                  "CONFIRMED"
+            );
+
+          const output = {
+            version:
+              "V4_CONFIRMED_GATE_AB_1",
+
+            mode:
+              "HISTORICAL_REPLAY_ONLY",
+
+            safety: {
+              scannerEnabled:
+                false,
+
+              paperOrdersEnabled:
+                false,
+
+              realOrdersEnabled:
+                false,
+
+              orderEndpointsUsed:
+                false,
+            },
+
+            hypothesis: {
+              control:
+                "Current gate: finalScore >= 7.75, confirmed structure, rr1 >= 2.0.",
+
+              variantB:
+                "Replay-only gate: finalScore >= 7.75, confirmed structure, rr2 >= 2.0; TP1 remains 1.8R.",
+
+              isolatedChange:
+                "Only CONFIRMED RR gate changes from rr1 to rr2 in disposable CI checkout. Committed v4_execution.js is restored unchanged.",
+            },
+
+            dataset:
+              controlSummary
+                ?.dataset ??
+              null,
+
+            replayWindow:
+              controlSummary
+                ?.replayWindow ??
+              null,
+
+            integrity: {
+              sameDatasetId:
+                controlSummary
+                  ?.dataset
+                  ?.id ===
+                variantSummary
+                  ?.dataset
+                  ?.id,
+
+              sameReplayWindow:
+                JSON.stringify(
+                  controlSummary
+                    ?.replayWindow
+                ) ===
+                JSON.stringify(
+                  variantSummary
+                    ?.replayWindow
+                ),
+
+              sameSignalPopulation,
+
+              controlSignals:
+                control.length,
+
+              variantSignals:
+                variant.length,
+            },
+
+            transitions,
+
+            control: {
+              total:
+                stats(
+                  control
+                ),
+
+              confirmed:
+                stats(
+                  controlConfirmed
+                ),
+
+              byDecision:
+                grouped(
+                  control,
+                  (x) =>
+                    x?.decision ??
+                    "UNKNOWN"
+                ),
+            },
+
+            variantB: {
+              total:
+                stats(
+                  variant
+                ),
+
+              starter:
+                stats(
+                  variantStarter
+                ),
+
+              confirmed:
+                stats(
+                  variantConfirmed
+                ),
+
+              reclassifiedStarterToConfirmed:
+                stats(
+                  reclassified
+                ),
+
+              confirmedBySymbol:
+                grouped(
+                  variantConfirmed,
+                  (x) =>
+                    x?.symbol ??
+                    "UNKNOWN"
+                ),
+
+              confirmedByDirection:
+                grouped(
+                  variantConfirmed,
+                  (x) =>
+                    x?.direction ??
+                    "UNKNOWN"
+                ),
+            },
+
+            guardrails: [
+              "Aggregate raw-R should stay identical if signal population is identical; this test changes classification/risk tier, not entry/stop/TP geometry.",
+              "Hypothetical paper-risk units use current sizing: STARTER 0.25R, strong STARTER 0.40R at finalScore >= 7.5, CONFIRMED 0.50R.",
+              "This is not account-equity simulation: overlap, correlation, fees, slippage and portfolio caps are not modeled.",
+              "Binance volume is a historical proxy; DOGE normalized-volume proxy remains unvalidated against BingX at the preregistered threshold.",
+              "Venue-native historical CVD/OI/funding/liquidations are not fabricated; FLOW remains partial where unavailable.",
+              "No PAPER or LIVE permission is granted by this test."
+            ],
+          };
+
+          await writeFile(
+            "artifacts_ab/v4_confirmed_ab_summary.json",
+            JSON.stringify(
+              output,
+              null,
+              2
+            ),
+            "utf8"
+          );
+
+          await writeFile(
+            "artifacts_ab/v4_confirmed_ab_changed.json",
+            JSON.stringify(
+              changed,
+              null,
+              2
+            ),
+            "utf8"
+          );
+
+          console.log(
+            "===== V4 CONFIRMED GATE A/B SUMMARY ====="
+          );
+
+          console.log(
+            JSON.stringify(
+              output,
+              null,
+              2
+            )
+          );
+
+          if (
+            !output
+              .integrity
+              .sameDatasetId
+          ) {
+            throw new Error(
+              "A/B integrity failure: dataset IDs differ"
+            );
+          }
+
+          if (
+            !output
+              .integrity
+              .sameReplayWindow
+          ) {
+            throw new Error(
+              "A/B integrity failure: replay windows differ"
+            );
+          }
+
+          if (
+            !sameSignalPopulation
+          ) {
+            throw new Error(
+              "A/B integrity failure: isolated CONFIRMED classification changed signal population"
+            );
+          }
+
+          if (
+            variantConfirmed
+              .length === 0
+          ) {
+            throw new Error(
+              "A/B hypothesis failure: RR2 variant still produced zero CONFIRMED signals"
+            );
+          }
+          NODE
+
+      - name: Show A-B Result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f artifacts_ab/v4_confirmed_ab_summary.json ]; then
+            echo "===== FINAL V4 CONFIRMED A/B RESULT ====="
+            cat artifacts_ab/v4_confirmed_ab_summary.json
+          else
+            echo "A/B summary was not generated."
+          fi
+
+      - name: Upload A-B Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-confirmed-gate-ab-results
+          path: |
+            artifacts_ab/v4_confirmed_ab_summary.json
+            artifacts_ab/v4_confirmed_ab_changed.json
+            artifacts_ab/control/v4_replay_summary.json
+            artifacts_ab/control/v4_replay_signals.json
+            artifacts_ab/control/v4_replay_signals.csv
+            artifacts_ab/variant_rr2/v4_replay_summary.json
+            artifacts_ab/variant_rr2/v4_replay_signals.json
+            artifacts_ab/variant_rr2/v4_replay_signals.csv
+          if-no-files-found: warn
+          retention-days: 30
