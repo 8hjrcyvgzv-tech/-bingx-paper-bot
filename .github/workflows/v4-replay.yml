@@ -28,7 +28,7 @@ on:
       - v4-clean-core
     paths:
       - "v4_replay_trigger.txt"
-      - ".github/workflows/v4-replay.yml" 
+      - ".github/workflows/v4-replay.yml"
 
 jobs:
   replay:
@@ -52,16 +52,56 @@ jobs:
           grep -q 'realOrdersEnabled: false' worker_v4_clean_core.js
           grep -q 'paperOrdersEnabled: false' worker_v4_clean_core.js
           grep -q 'realOrderPermission: false' worker_v4_clean_core.js
+          grep -q 'tradePermission: false' v4_catalyst.js
           echo "V4 REPLAY SAFETY: PASS"
 
-      - name: Run Tiberius Replay
-        env:
-          REPLAY_SYMBOLS: ${{ inputs.symbols || 'XRP-USDT,ZEC-USDT' }}
-          REPLAY_DAYS: ${{ inputs.days || '30' }}
-          REPLAY_STEP_MIN: ${{ inputs.step_minutes || '15' }}
-          REPLAY_OUTCOME_HOURS: ${{ inputs.outcome_hours || '24' }}
+      - name: Deterministic V4 Logic Tests
         run: |
-          node v4_replay_runner.mjs
+          node v4_logic_test.mjs
+
+      - name: Resolve Replay Config
+        shell: bash
+        env:
+          INPUT_SYMBOLS: ${{ inputs.symbols }}
+          INPUT_DAYS: ${{ inputs.days }}
+          INPUT_STEP_MIN: ${{ inputs.step_minutes }}
+          INPUT_OUTCOME_HOURS: ${{ inputs.outcome_hours }}
+        run: |
+          get_cfg() {
+            local key="$1"
+            if [ ! -f v4_replay_trigger.txt ]; then
+              return 0
+            fi
+            grep -m1 "^${key}=" v4_replay_trigger.txt | cut -d= -f2- || true
+          }
+
+          SYMBOLS="${INPUT_SYMBOLS:-$(get_cfg symbols)}"
+          DAYS="${INPUT_DAYS:-$(get_cfg days)}"
+          STEP_MIN="${INPUT_STEP_MIN:-$(get_cfg step_minutes)}"
+          OUTCOME_HOURS="${INPUT_OUTCOME_HOURS:-$(get_cfg outcome_hours)}"
+          COOLDOWN_HOURS="$(get_cfg signal_cooldown_hours)"
+
+          SYMBOLS="${SYMBOLS:-BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT}"
+          DAYS="${DAYS:-30}"
+          STEP_MIN="${STEP_MIN:-15}"
+          OUTCOME_HOURS="${OUTCOME_HOURS:-24}"
+          COOLDOWN_HOURS="${COOLDOWN_HOURS:-6}"
+
+          echo "REPLAY_SYMBOLS=${SYMBOLS}" >> "$GITHUB_ENV"
+          echo "REPLAY_DAYS=${DAYS}" >> "$GITHUB_ENV"
+          echo "REPLAY_STEP_MIN=${STEP_MIN}" >> "$GITHUB_ENV"
+          echo "REPLAY_OUTCOME_HOURS=${OUTCOME_HOURS}" >> "$GITHUB_ENV"
+          echo "REPLAY_SIGNAL_COOLDOWN_HOURS=${COOLDOWN_HOURS}" >> "$GITHUB_ENV"
+
+          echo "Replay symbols: ${SYMBOLS}"
+          echo "Replay days: ${DAYS}"
+          echo "Replay step: ${STEP_MIN}m"
+          echo "Outcome horizon: ${OUTCOME_HOURS}h"
+          echo "Signal cooldown: ${COOLDOWN_HOURS}h"
+
+      - name: Run Tiberius Replay
+        run: |
+          node v4_replay_harness_patch.mjs
 
       - name: Show Replay Summary
         if: always()
