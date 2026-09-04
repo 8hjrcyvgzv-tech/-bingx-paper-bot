@@ -23,6 +23,10 @@ on:
         required: true
         default: "24"
 
+  push:
+    branches:
+      - v4-clean-core
+
 jobs:
   replay:
     runs-on: ubuntu-latest
@@ -49,10 +53,10 @@ jobs:
 
       - name: Run Tiberius Replay
         env:
-          REPLAY_SYMBOLS: ${{ inputs.symbols }}
-          REPLAY_DAYS: ${{ inputs.days }}
-          REPLAY_STEP_MIN: ${{ inputs.step_minutes }}
-          REPLAY_OUTCOME_HOURS: ${{ inputs.outcome_hours }}
+          REPLAY_SYMBOLS: ${{ inputs.symbols || 'XRP-USDT,ZEC-USDT' }}
+          REPLAY_DAYS: ${{ inputs.days || '30' }}
+          REPLAY_STEP_MIN: ${{ inputs.step_minutes || '15' }}
+          REPLAY_OUTCOME_HOURS: ${{ inputs.outcome_hours || '24' }}
         run: |
           node v4_replay_runner.mjs
 
