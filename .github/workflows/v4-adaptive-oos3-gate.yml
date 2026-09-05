@@ -1,0 +1,221 @@
+name: V4 Adaptive Risk Leverage + Fresh OOS3 Gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - "v4_adaptive_risk_leverage.mjs"
+      - "v4_adaptive_risk_leverage_lab.mjs"
+      - "v4_oos3_adaptive_locked.mjs"
+      - ".github/workflows/v4-adaptive-oos3-gate.yml"
+
+jobs:
+  adaptive_oos3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+      OOS3_FIXED_END_DAY: "2025-01-08"
+      OOS1_RUN_ID: "33975089837"
+      OOS1_ARTIFACT_NAME: "v4-structure-exit-oos-costs-results"
+      OOS2_RUN_ID: "33976255962"
+      OOS2_ARTIFACT_NAME: "v4-fresh-oos2-locked-results"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f v4_build_frozen_dataset.py
+          test -f v4_frozen_replay_harness.mjs
+          test -f v4_frozen_data_provider.mjs
+          test -f v4_structure_exit_runner.mjs
+          test -f v4_structure_exit_oos_costs.mjs
+          test -f v4_adaptive_risk_leverage.mjs
+          test -f v4_adaptive_risk_leverage_lab.mjs
+          test -f v4_oos3_adaptive_locked.mjs
+          python -m py_compile v4_build_frozen_dataset.py
+          node --check v4_frozen_replay_harness.mjs
+          node --check v4_frozen_data_provider.mjs
+          node --check v4_structure_exit_runner.mjs
+          node --check v4_structure_exit_oos_costs.mjs
+          node --check v4_adaptive_risk_leverage.mjs
+          node --check v4_adaptive_risk_leverage_lab.mjs
+          node --check v4_oos3_adaptive_locked.mjs
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' \
+            v4_adaptive_risk_leverage.mjs \
+            v4_adaptive_risk_leverage_lab.mjs \
+            v4_oos3_adaptive_locked.mjs \
+            v4_structure_exit_oos_costs.mjs \
+            v4_structure_exit_runner.mjs \
+            v4_frozen_replay_harness.mjs \
+            v4_frozen_data_provider.mjs
+          echo "V4 ADAPTIVE + OOS3: READ-ONLY SAFETY PASS"
+
+      - name: Download Consumed OOS1 + OOS2 Artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf consumed
+          mkdir -p consumed/oos1 consumed/oos2
+          gh run download "$OOS1_RUN_ID" -n "$OOS1_ARTIFACT_NAME" -D consumed/oos1
+          gh run download "$OOS2_RUN_ID" -n "$OOS2_ARTIFACT_NAME" -D consumed/oos2
+          test -f consumed/oos1/artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+          test -f consumed/oos2/artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+
+      - name: Adaptive Sanity On Consumed OOS1/OOS2
+        shell: bash
+        env:
+          OOS1_EVENTS_PATH: consumed/oos1/artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+          OOS2_EVENTS_PATH: consumed/oos2/artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+        run: |
+          set -euo pipefail
+          rm -rf diagnostics/adaptive_lab
+          node v4_adaptive_risk_leverage_lab.mjs
+          test -f diagnostics/adaptive_lab/v4_adaptive_risk_leverage_lab_summary.json
+
+      - name: Lock Check Before Fresh OOS3
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          decision="$(node -e "const fs=require('fs');const x=JSON.parse(fs.readFileSync('diagnostics/adaptive_lab/v4_adaptive_risk_leverage_lab_summary.json','utf8'));process.stdout.write(x.decision)")"
+          echo "Adaptive diagnostic decision: $decision"
+          if [ "$decision" = "LOCK_POLICY_FOR_FRESH_OOS3" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Fresh Frozen OOS3 Dataset
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf frozen_dataset .v4_oos3_builder.py
+          cp v4_build_frozen_dataset.py .v4_oos3_builder.py
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.v4_oos3_builder.py')
+          s = p.read_text(encoding='utf-8')
+          old = '    latest_day = latest_complete_archive_day()'
+          new = '''    fixed_end = os.getenv("OOS3_FIXED_END_DAY")\n    if not fixed_end:\n        raise RuntimeError("OOS3_FIXED_END_DAY is required")\n    latest_day = datetime.strptime(fixed_end, "%Y-%m-%d").replace(tzinfo=timezone.utc)\n    print(f"[OOS3-LOCK] fixed dataset end: {latest_day.date()}")'''
+          if s.count(old) != 1:
+              raise SystemExit('Could not uniquely patch fixed OOS3 end date')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+          V4_WARMUP_DAYS=100 \
+          V4_REPLAY_DAYS=100 \
+          V4_OUTCOME_TAIL_DAYS=1 \
+          V4_DATASET_SYMBOLS="$REPLAY_SYMBOLS" \
+          python .v4_oos3_builder.py
+          rm -f .v4_oos3_builder.py
+          test -f frozen_dataset/manifest.json
+          test -f frozen_dataset/build_summary.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          m = json.loads(Path('frozen_dataset/manifest.json').read_text())
+          if m.get('status') != 'FROZEN_EXACT_PASS':
+              raise SystemExit(f"OOS3 dataset build failed: {m.get('status')}")
+          layout = m['layout']
+          expected = {
+              'datasetStart': '2024-06-22',
+              'replayStart': '2024-09-30',
+              'replayEnd': '2025-01-07',
+              'datasetEnd': '2025-01-08',
+          }
+          for key, day in expected.items():
+              if not str(layout[key]).startswith(day):
+                  raise SystemExit(f"Unexpected OOS3 {key}: {layout[key]}")
+          with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as f:
+              f.write(f"V4_FROZEN_DATASET_ID={m['datasetId']}\n")
+              f.write(f"V4_FROZEN_ROOT_SHA256={m['rootContentSha256']}\n")
+          print(json.dumps({'datasetId': m['datasetId'], 'rootContentSha256': m['rootContentSha256'], 'layout': layout}, indent=2))
+          PY
+
+      - name: Run Fresh Frozen OOS3 Control
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts
+          node v4_frozen_replay_harness.mjs
+          test -f artifacts/v4_replay_signals.json
+          test -f artifacts/v4_replay_summary.json
+
+      - name: Build OOS3 Structure Exit A Costed Events
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node v4_structure_exit_oos_costs.mjs
+          test -f artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json
+          test -f artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+
+      - name: Run Fresh OOS3 Adaptive Locked Validation
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node v4_oos3_adaptive_locked.mjs
+          test -f artifacts/oos3_adaptive/v4_oos3_adaptive_locked_summary.json
+
+      - name: Show Final Result
+        if: always()
+        shell: bash
+        run: |
+          echo "===== ADAPTIVE DIAGNOSTIC ====="
+          if [ -f diagnostics/adaptive_lab/v4_adaptive_risk_leverage_lab_summary.json ]; then
+            cat diagnostics/adaptive_lab/v4_adaptive_risk_leverage_lab_summary.json
+          fi
+          echo "===== FRESH OOS3 ====="
+          if [ -f artifacts/oos3_adaptive/v4_oos3_adaptive_locked_summary.json ]; then
+            cat artifacts/oos3_adaptive/v4_oos3_adaptive_locked_summary.json
+          else
+            echo "OOS3 was not run because the adaptive sanity lock did not pass."
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-adaptive-risk-leverage-oos3-results
+          path: |
+            diagnostics/adaptive_lab/v4_adaptive_risk_leverage_lab_summary.json
+            frozen_dataset/manifest.json
+            frozen_dataset/build_summary.json
+            frozen_dataset/data/*.csv.gz
+            artifacts/v4_replay_summary.json
+            artifacts/v4_replay_signals.json
+            artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json
+            artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+            artifacts/oos3_adaptive/v4_oos3_adaptive_locked_summary.json
+          if-no-files-found: warn
+          retention-days: 30
