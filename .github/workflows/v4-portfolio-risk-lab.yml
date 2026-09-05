@@ -1,0 +1,74 @@
+name: V4 Portfolio Risk Lab
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - "v4_portfolio_risk_lab.mjs"
+      - ".github/workflows/v4-portfolio-risk-lab.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f v4_portfolio_risk_lab.mjs
+          node --check v4_portfolio_risk_lab.mjs
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|fetch\([^)]*POST|method[[:space:]]*:[[:space:]]*["'"'"']POST["'"'"']' v4_portfolio_risk_lab.mjs
+          echo "V4 PORTFOLIO RISK LAB: READ-ONLY SAFETY PASS"
+
+      - name: Download Consumed OOS1 Artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf oos1
+          mkdir -p oos1
+          gh run download 33975089837 \
+            --repo "${{ github.repository }}" \
+            --name v4-structure-exit-oos-costs-results \
+            --dir oos1
+          test -f oos1/artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+          test -f oos1/artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json
+
+      - name: Run 100 Dollar Portfolio Risk Matrix
+        shell: bash
+        env:
+          OOS_EVENTS_PATH: oos1/artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+        run: |
+          set -euo pipefail
+          rm -rf artifacts/portfolio_lab
+          node v4_portfolio_risk_lab.mjs
+          test -f artifacts/portfolio_lab/v4_portfolio_risk_lab_summary.json
+
+      - name: Show Result
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat artifacts/portfolio_lab/v4_portfolio_risk_lab_summary.json
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-portfolio-risk-lab-results
+          path: artifacts/portfolio_lab/v4_portfolio_risk_lab_summary.json
+          retention-days: 30
