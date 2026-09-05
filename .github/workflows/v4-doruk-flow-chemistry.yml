@@ -1,0 +1,2024 @@
+name: V4 Doruk Flow Chemistry Replay
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - ".github/workflows/v4-doruk-flow-chemistry.yml"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      V4_FROZEN_DATASET_ID: V4_CORE6_BINANCE_UM_5M_20260215_20260903_EBECBEDEEE03
+      V4_FROZEN_ROOT_SHA256: ebecbedeee03954dc9a8ff5fdabf764ebf92fb8cd90b30a659f8cbeaf9d67965
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_START: "2026-05-26T00:00:00.000Z"
+      REPLAY_END: "2026-09-02T23:59:59.999Z"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+      FLOW_ARCHIVE_WORKERS: "12"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download Frozen Dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: v4-frozen-core6-200d-dataset
+          path: frozen_dataset
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33924848219
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f v4_radar.js
+          test -f v4_direction.js
+          test -f v4_structure.js
+          test -f v4_flow.js
+          test -f v4_frozen_data_provider.mjs
+          test -f frozen_dataset/manifest.json
+
+          grep -q 'strongScore: 7.0' v4_radar.js
+          grep -q 'strongDirectionScore: 7.0' v4_direction.js
+          grep -q 'strongScore: 7.0' v4_structure.js
+          grep -q 'V4_FLOW_2' v4_flow.js
+          grep -q 'supportiveScore: 5.75' v4_flow.js
+          grep -q 'againstScore: 4.25' v4_flow.js
+          grep -q 'pressureStrongScore: 7.0' v4_flow.js
+
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']'             v4_radar.js             v4_direction.js             v4_structure.js             v4_flow.js             v4_frozen_data_provider.mjs
+
+          echo "V4 DORUK FLOW LAB: HISTORICAL READ-ONLY PASS"
+
+      - name: Create Flow Proxy Builder
+        shell: bash
+        run: |
+          cat > v4_flow_proxy_builder.py <<'PY'
+          #!/usr/bin/env python3
+          # V4 FLOW PROXY DATA BUILDER
+          # HISTORICAL RESEARCH ONLY — NO ORDERS / NO PAPER / NO LIVE
+          #
+          # Purpose:
+          # Build a same-window FLOW research proxy for Doruk's module using:
+          # 1) Binance Spot 5m kline taker-buy quote volume -> 5m signed-flow CVD proxy
+          # 2) Binance USD-M Futures 5m kline taker-buy quote volume -> 5m signed-flow CVD proxy
+          # 3) Binance USD-M daily metrics -> real open-interest series
+          #
+          # Funding and liquidation history are intentionally NOT invented.
+          # v4_flow.js treats missing families neutrally. Expected coverage = 3/5 = 0.60.
+
+          from __future__ import annotations
+
+          import csv
+          import gzip
+          import hashlib
+          import io
+          import json
+          import math
+          import os
+          import time
+          import urllib.request
+          import zipfile
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          from typing import Any
+
+          VERSION = "V4_FLOW_PROXY_BUILDER_1"
+          USER_AGENT = "V4-Flow-Proxy-Builder/1.0"
+          INTERVAL_MS = 5 * 60_000
+          BARS_PER_DAY = 288
+
+          DATA_START = datetime(2026, 5, 25, tzinfo=timezone.utc)
+          DATA_END = datetime(2026, 9, 2, tzinfo=timezone.utc)
+          EXPECTED_DAYS = (DATA_END.date() - DATA_START.date()).days + 1
+          EXPECTED_KLINE_ROWS = EXPECTED_DAYS * BARS_PER_DAY
+
+          SYMBOLS = [
+              s.strip().upper()
+              for s in os.getenv(
+                  "FLOW_SYMBOLS",
+                  "BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT",
+              ).split(",")
+              if s.strip()
+          ]
+
+          WORKERS = int(os.getenv("FLOW_ARCHIVE_WORKERS", "12"))
+
+          FUT_DAILY = "https://data.binance.vision/data/futures/um/daily/klines"
+          FUT_MONTHLY = "https://data.binance.vision/data/futures/um/monthly/klines"
+          SPOT_DAILY = "https://data.binance.vision/data/spot/daily/klines"
+          SPOT_MONTHLY = "https://data.binance.vision/data/spot/monthly/klines"
+          METRICS_DAILY = "https://data.binance.vision/data/futures/um/daily/metrics"
+
+          OUTDIR = Path("flow_proxy_data")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          _cache: dict[str, tuple[bytes, dict[str, Any]]] = {}
+
+
+          def symbol_code(symbol: str) -> str:
+              return symbol.replace("-", "")
+
+
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest().lower()
+
+
+          def normalize_ts_ms(value: Any) -> int | None:
+              try:
+                  n = int(float(value))
+              except (TypeError, ValueError):
+                  return None
+
+              # Spot archive timestamps are microseconds for newer data.
+              if n > 100_000_000_000_000:
+                  n //= 1000
+              elif n < 100_000_000_000:
+                  # Defensive seconds support.
+                  n *= 1000
+              return n
+
+
+          def parse_datetime_ms(value: Any) -> int | None:
+              numeric = normalize_ts_ms(value)
+              if numeric is not None:
+                  return numeric
+
+              text = str(value or "").strip()
+              if not text:
+                  return None
+
+              variants = [
+                  text,
+                  text.replace("Z", "+00:00"),
+                  text.replace(" ", "T") + ("+00:00" if "+" not in text and "Z" not in text else ""),
+              ]
+
+              for item in variants:
+                  try:
+                      dt = datetime.fromisoformat(item)
+                      if dt.tzinfo is None:
+                          dt = dt.replace(tzinfo=timezone.utc)
+                      return int(dt.timestamp() * 1000)
+                  except ValueError:
+                      pass
+
+              for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+                  try:
+                      dt = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+                      return int(dt.timestamp() * 1000)
+                  except ValueError:
+                      pass
+
+              return None
+
+
+          def http_get_bytes(url: str, timeout: int = 45) -> bytes:
+              last_error = None
+              for attempt in range(1, 4):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as resp:
+                          return resp.read()
+                  except Exception as exc:
+                      last_error = exc
+                      if attempt < 3:
+                          time.sleep(0.75 * attempt)
+              raise RuntimeError(f"download failed after retries: {url}: {last_error}")
+
+
+          def fetch_verified_zip(url: str) -> tuple[bytes, dict[str, Any]]:
+              if url in _cache:
+                  return _cache[url]
+
+              payload = http_get_bytes(url)
+              checksum_text = http_get_bytes(url + ".CHECKSUM").decode(
+                  "utf-8", errors="replace"
+              ).strip()
+
+              expected = checksum_text.split()[0].strip().lower()
+              actual = sha256_bytes(payload)
+
+              if len(expected) != 64:
+                  raise RuntimeError(f"Invalid CHECKSUM format for {url}")
+
+              if actual != expected:
+                  raise RuntimeError(
+                      f"SHA256 mismatch for {url}: expected={expected} actual={actual}"
+                  )
+
+              meta = {
+                  "url": url,
+                  "sha256": actual,
+                  "bytes": len(payload),
+                  "checksumVerified": True,
+              }
+              _cache[url] = (payload, meta)
+              return payload, meta
+
+
+          def month_start(dt: datetime) -> datetime:
+              return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+          def next_month(dt: datetime) -> datetime:
+              if dt.month == 12:
+                  return dt.replace(year=dt.year + 1, month=1, day=1)
+              return dt.replace(month=dt.month + 1, day=1)
+
+
+          def month_end_day(dt: datetime) -> datetime:
+              return next_month(month_start(dt)) - timedelta(days=1)
+
+
+          def enumerate_days(start: datetime, end: datetime) -> list[datetime]:
+              out = []
+              cur = start
+              while cur <= end:
+                  out.append(cur)
+                  cur += timedelta(days=1)
+              return out
+
+
+          def kline_daily_url(base: str, symbol: str, day: datetime) -> str:
+              s = symbol_code(symbol)
+              d = day.strftime("%Y-%m-%d")
+              return f"{base}/{s}/5m/{s}-5m-{d}.zip"
+
+
+          def kline_monthly_url(base: str, symbol: str, month: datetime) -> str:
+              s = symbol_code(symbol)
+              ym = month.strftime("%Y-%m")
+              return f"{base}/{s}/5m/{s}-5m-{ym}.zip"
+
+
+          def metrics_daily_url(symbol: str, day: datetime) -> str:
+              s = symbol_code(symbol)
+              d = day.strftime("%Y-%m-%d")
+              return f"{METRICS_DAILY}/{s}/{s}-metrics-{d}.zip"
+
+
+          def plan_kline_archives(
+              symbol: str,
+              daily_base: str,
+              monthly_base: str,
+          ) -> list[dict[str, Any]]:
+              plan: list[dict[str, Any]] = []
+              cur = month_start(DATA_START)
+
+              while cur <= DATA_END:
+                  m_start = cur
+                  m_end = month_end_day(cur)
+
+                  use_start = max(DATA_START, m_start)
+                  use_end = min(DATA_END, m_end)
+
+                  full_month = use_start == m_start and use_end == m_end
+
+                  if full_month:
+                      plan.append({
+                          "kind": "MONTHLY",
+                          "symbol": symbol,
+                          "month": m_start,
+                          "start": use_start,
+                          "end": use_end,
+                          "url": kline_monthly_url(monthly_base, symbol, m_start),
+                          "dailyBase": daily_base,
+                      })
+                  else:
+                      for day in enumerate_days(use_start, use_end):
+                          plan.append({
+                              "kind": "DAILY",
+                              "symbol": symbol,
+                              "day": day,
+                              "start": day,
+                              "end": day,
+                              "url": kline_daily_url(daily_base, symbol, day),
+                              "dailyBase": daily_base,
+                          })
+
+                  cur = next_month(cur)
+
+              return plan
+
+
+          def parse_kline_zip(payload: bytes) -> list[dict[str, Any]]:
+              rows = []
+
+              with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                  csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                  if not csv_names:
+                      raise RuntimeError("kline ZIP contains no CSV")
+
+                  with zf.open(csv_names[0]) as raw:
+                      text = io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+                      reader = csv.reader(text)
+
+                      for row in reader:
+                          if len(row) < 11:
+                              continue
+
+                          open_ms = normalize_ts_ms(row[0])
+                          close_ms = normalize_ts_ms(row[6])
+
+                          try:
+                              close = float(row[4])
+                              quote_volume = float(row[7])
+                              taker_buy_quote = float(row[10])
+                          except (TypeError, ValueError):
+                              continue
+
+                          if (
+                              open_ms is None
+                              or close_ms is None
+                              or not all(
+                                  math.isfinite(x)
+                                  for x in (close, quote_volume, taker_buy_quote)
+                              )
+                              or close <= 0
+                              or quote_volume < 0
+                              or taker_buy_quote < 0
+                          ):
+                              continue
+
+                          signed_quote = 2.0 * taker_buy_quote - quote_volume
+
+                          rows.append({
+                              "openTimeMs": open_ms,
+                              "closeTimeMs": close_ms,
+                              "close": close,
+                              "signedQuote": signed_quote,
+                          })
+
+              return rows
+
+
+          def fetch_kline_plan_item(item: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+              if item["kind"] == "DAILY":
+                  payload, meta = fetch_verified_zip(item["url"])
+                  return parse_kline_zip(payload), [{
+                      **meta,
+                      "kind": "DAILY",
+                      "day": item["day"].strftime("%Y-%m-%d"),
+                  }]
+
+              try:
+                  payload, meta = fetch_verified_zip(item["url"])
+                  return parse_kline_zip(payload), [{
+                      **meta,
+                      "kind": "MONTHLY",
+                      "month": item["month"].strftime("%Y-%m"),
+                  }]
+              except Exception as monthly_error:
+                  print(
+                      f"[FALLBACK] monthly kline unavailable "
+                      f"{item['symbol']} {item['month'].strftime('%Y-%m')}: "
+                      f"{monthly_error}"
+                  )
+
+                  rows: list[dict[str, Any]] = []
+                  metas: list[dict[str, Any]] = []
+
+                  for day in enumerate_days(item["start"], item["end"]):
+                      url = kline_daily_url(item["dailyBase"], item["symbol"], day)
+                      payload, meta = fetch_verified_zip(url)
+                      rows.extend(parse_kline_zip(payload))
+                      metas.append({
+                          **meta,
+                          "kind": "DAILY_FALLBACK",
+                          "day": day.strftime("%Y-%m-%d"),
+                      })
+
+                  return rows, metas
+
+
+          def dedupe_sort(rows: list[dict[str, Any]], key: str) -> tuple[list[dict[str, Any]], int]:
+              by_ts: dict[int, dict[str, Any]] = {}
+              duplicates = 0
+
+              for row in rows:
+                  ts = int(row[key])
+                  if ts in by_ts:
+                      duplicates += 1
+                  by_ts[ts] = row
+
+              return [by_ts[k] for k in sorted(by_ts)], duplicates
+
+
+          def exact_kline_window(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+              start_ms = int(DATA_START.timestamp() * 1000)
+              end_open_ms = int(
+                  (DATA_END + timedelta(days=1)).timestamp() * 1000
+              ) - INTERVAL_MS
+
+              filtered = [
+                  x for x in rows
+                  if start_ms <= int(x["openTimeMs"]) <= end_open_ms
+              ]
+
+              ordered, duplicates = dedupe_sort(filtered, "openTimeMs")
+
+              gaps = 0
+              for i in range(1, len(ordered)):
+                  if ordered[i]["openTimeMs"] - ordered[i - 1]["openTimeMs"] != INTERVAL_MS:
+                      gaps += 1
+
+              integrity = {
+                  "rows": len(ordered),
+                  "expectedRows": EXPECTED_KLINE_ROWS,
+                  "duplicates": duplicates,
+                  "gaps": gaps,
+                  "pass": (
+                      len(ordered) == EXPECTED_KLINE_ROWS
+                      and duplicates == 0
+                      and gaps == 0
+                  ),
+              }
+
+              if not integrity["pass"]:
+                  raise RuntimeError(f"kline integrity failed: {integrity}")
+
+              return ordered, integrity
+
+
+          def build_cvd_series(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+              cumulative = 0.0
+              out = []
+
+              for row in rows:
+                  cumulative += float(row["signedQuote"])
+                  out.append({
+                      "ts": int(row["closeTimeMs"]),
+                      "value": cumulative,
+                  })
+
+              return out
+
+
+          def parse_metrics_zip(payload: bytes) -> list[dict[str, Any]]:
+              out = []
+
+              with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                  csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                  if not csv_names:
+                      raise RuntimeError("metrics ZIP contains no CSV")
+
+                  with zf.open(csv_names[0]) as raw:
+                      text = io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+                      material = text.read()
+
+              lines = [line for line in material.splitlines() if line.strip()]
+              if not lines:
+                  return out
+
+              reader = csv.reader(lines)
+              all_rows = list(reader)
+              if not all_rows:
+                  return out
+
+              header = [str(x).strip().lower() for x in all_rows[0]]
+              has_header = "create_time" in header or "symbol" in header
+
+              if has_header:
+                  idx = {name: i for i, name in enumerate(header)}
+                  time_idx = idx.get("create_time", 0)
+                  oi_idx = idx.get("sum_open_interest")
+                  if oi_idx is None:
+                      oi_idx = idx.get("sum_open_interest_value")
+                  data_rows = all_rows[1:]
+              else:
+                  time_idx = 0
+                  oi_idx = 2
+                  data_rows = all_rows
+
+              if oi_idx is None:
+                  raise RuntimeError(f"metrics OI column not found; header={header}")
+
+              for row in data_rows:
+                  if len(row) <= max(time_idx, oi_idx):
+                      continue
+
+                  ts = parse_datetime_ms(row[time_idx])
+
+                  try:
+                      oi = float(row[oi_idx])
+                  except (TypeError, ValueError):
+                      continue
+
+                  if ts is None or not math.isfinite(oi) or oi <= 0:
+                      continue
+
+                  out.append({"ts": ts, "value": oi})
+
+              return out
+
+
+          def fetch_metrics_day(symbol: str, day: datetime) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+              url = metrics_daily_url(symbol, day)
+              payload, meta = fetch_verified_zip(url)
+              rows = parse_metrics_zip(payload)
+
+              return rows, {
+                  **meta,
+                  "kind": "DAILY_METRICS",
+                  "day": day.strftime("%Y-%m-%d"),
+              }
+
+
+          def fetch_all_kline_rows(
+              symbol: str,
+              daily_base: str,
+              monthly_base: str,
+          ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+              plan = plan_kline_archives(symbol, daily_base, monthly_base)
+              rows: list[dict[str, Any]] = []
+              metas: list[dict[str, Any]] = []
+
+              with ThreadPoolExecutor(max_workers=min(WORKERS, len(plan))) as pool:
+                  future_map = {
+                      pool.submit(fetch_kline_plan_item, item): item
+                      for item in plan
+                  }
+
+                  for future in as_completed(future_map):
+                      part_rows, part_meta = future.result()
+                      rows.extend(part_rows)
+                      metas.extend(part_meta)
+
+              return rows, metas
+
+
+          def fetch_all_metrics(symbol: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+              days = enumerate_days(DATA_START, DATA_END)
+              rows: list[dict[str, Any]] = []
+              metas: list[dict[str, Any]] = []
+
+              with ThreadPoolExecutor(max_workers=min(WORKERS, len(days))) as pool:
+                  future_map = {
+                      pool.submit(fetch_metrics_day, symbol, day): day
+                      for day in days
+                  }
+
+                  for future in as_completed(future_map):
+                      day = future_map[future]
+                      try:
+                          part_rows, meta = future.result()
+                      except Exception as exc:
+                          raise RuntimeError(
+                              f"metrics download failed {symbol} {day.date()}: {exc}"
+                          ) from exc
+
+                      rows.extend(part_rows)
+                      metas.append(meta)
+
+              ordered, duplicates = dedupe_sort(rows, "ts")
+
+              start_ms = int(DATA_START.timestamp() * 1000)
+              end_ms = int((DATA_END + timedelta(days=1)).timestamp() * 1000) - 1
+              ordered = [x for x in ordered if start_ms <= x["ts"] <= end_ms]
+
+              expected_min = int(EXPECTED_KLINE_ROWS * 0.90)
+
+              integrity = {
+                  "rows": len(ordered),
+                  "expectedApprox": EXPECTED_KLINE_ROWS,
+                  "minimumAccepted": expected_min,
+                  "duplicates": duplicates,
+                  "pass": len(ordered) >= expected_min,
+              }
+
+              if not integrity["pass"]:
+                  raise RuntimeError(f"metrics coverage failed {symbol}: {integrity}")
+
+              return ordered, metas
+
+
+          def main() -> None:
+              manifest = {
+                  "version": VERSION,
+                  "mode": "HISTORICAL_RESEARCH_ONLY",
+                  "source": "BINANCE_OFFICIAL_PUBLIC_ARCHIVE",
+                  "window": {
+                      "start": DATA_START.isoformat().replace("+00:00", "Z"),
+                      "end": (DATA_END + timedelta(days=1) - timedelta(milliseconds=1))
+                          .isoformat()
+                          .replace("+00:00", "Z"),
+                      "days": EXPECTED_DAYS,
+                  },
+                  "families": {
+                      "spotCvdProxy": "5m spot signed quote taker imbalance, cumulatively summed",
+                      "futuresCvdProxy": "5m USD-M futures signed quote taker imbalance, cumulatively summed",
+                      "openInterest": "USD-M public metrics sum_open_interest",
+                      "funding": "NOT_INCLUDED_NEUTRAL",
+                      "liquidations": "NOT_INCLUDED_NEUTRAL",
+                  },
+                  "expectedFlowCoverage": 0.60,
+                  "symbols": {},
+                  "integrityPass": True,
+                  "paperOrdersEnabled": False,
+                  "realOrdersEnabled": False,
+              }
+
+              for symbol in SYMBOLS:
+                  print(f"\n========== FLOW PROXY {symbol} ==========")
+
+                  fut_rows_raw, fut_sources = fetch_all_kline_rows(
+                      symbol,
+                      FUT_DAILY,
+                      FUT_MONTHLY,
+                  )
+                  fut_rows, fut_integrity = exact_kline_window(fut_rows_raw)
+
+                  spot_rows_raw, spot_sources = fetch_all_kline_rows(
+                      symbol,
+                      SPOT_DAILY,
+                      SPOT_MONTHLY,
+                  )
+                  spot_rows, spot_integrity = exact_kline_window(spot_rows_raw)
+
+                  oi_rows, oi_sources = fetch_all_metrics(symbol)
+
+                  payload = {
+                      "symbol": symbol,
+                      "window": manifest["window"],
+                      "spotCvd": build_cvd_series(spot_rows),
+                      "futuresCvd": build_cvd_series(fut_rows),
+                      "openInterest": oi_rows,
+                      "fundingRate": None,
+                      "liquidations": [],
+                  }
+
+                  raw = json.dumps(
+                      payload,
+                      separators=(",", ":"),
+                      ensure_ascii=False,
+                  ).encode("utf-8")
+
+                  compressed = gzip.compress(raw, compresslevel=9)
+                  file_name = f"{symbol.replace('-', '')}_flow_proxy.json.gz"
+                  out_path = OUTDIR / file_name
+                  out_path.write_bytes(compressed)
+
+                  entry = {
+                      "file": str(out_path),
+                      "gzipSha256": sha256_bytes(compressed),
+                      "jsonSha256": sha256_bytes(raw),
+                      "gzipBytes": len(compressed),
+                      "spotIntegrity": spot_integrity,
+                      "futuresIntegrity": fut_integrity,
+                      "openInterestRows": len(oi_rows),
+                      "sourceFileCount": {
+                          "spot": len(spot_sources),
+                          "futures": len(fut_sources),
+                          "openInterest": len(oi_sources),
+                      },
+                      "integrityPass": True,
+                  }
+
+                  manifest["symbols"][symbol] = entry
+
+                  print(
+                      f"[PASS] {symbol} "
+                      f"spot={spot_integrity['rows']} "
+                      f"futures={fut_integrity['rows']} "
+                      f"oi={len(oi_rows)} "
+                      f"gzip={len(compressed)}"
+                  )
+
+              manifest_bytes = json.dumps(
+                  manifest,
+                  indent=2,
+                  ensure_ascii=False,
+              ).encode("utf-8")
+
+              (OUTDIR / "manifest.json").write_bytes(manifest_bytes)
+
+              print("\n===== FLOW PROXY BUILD PASS =====")
+              print(json.dumps({
+                  "version": VERSION,
+                  "symbols": list(manifest["symbols"]),
+                  "expectedFlowCoverage": manifest["expectedFlowCoverage"],
+                  "integrityPass": manifest["integrityPass"],
+              }, indent=2))
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile v4_flow_proxy_builder.py
+
+      - name: Build Historical Flow Proxy
+        run: python v4_flow_proxy_builder.py
+
+      - name: Create Doruk Chemistry Replay
+        shell: bash
+        run: |
+          cat > v4_doruk_flow_chemistry_replay.mjs <<'NODE'
+          import { mkdir, readFile, writeFile } from "node:fs/promises";
+          import { gunzipSync } from "node:zlib";
+
+          import {
+            analyzeV4Radar,
+            V4_RADAR_CFG,
+          } from "./v4_radar.js";
+
+          import {
+            analyzeV4Direction,
+            V4_DIRECTION_CFG,
+          } from "./v4_direction.js";
+
+          import {
+            analyzeV4Structure,
+            V4_STRUCTURE_CFG,
+          } from "./v4_structure.js";
+
+          import {
+            analyzeV4Flow,
+            V4_FLOW_CFG,
+          } from "./v4_flow.js";
+
+          import {
+            loadFrozenManifest,
+            loadFrozenFiveMinuteRows,
+          } from "./v4_frozen_data_provider.mjs";
+
+          const VERSION = "V4_DORUK_FLOW_CHEMISTRY_REPLAY_1";
+          const DAY = 24 * 60 * 60 * 1000;
+          const HOUR = 60 * 60 * 1000;
+          const MINUTE = 60 * 1000;
+
+          const CONFIG = {
+            symbols: String(
+              process.env.REPLAY_SYMBOLS ||
+                "BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT"
+            )
+              .split(",")
+              .map((x) => x.trim().toUpperCase())
+              .filter(Boolean),
+
+            replayStart: Date.parse(
+              process.env.REPLAY_START || "2026-05-26T00:00:00.000Z"
+            ),
+
+            replayEnd: Date.parse(
+              process.env.REPLAY_END || "2026-09-02T23:59:59.999Z"
+            ),
+
+            stepMinutes: Number(process.env.REPLAY_STEP_MIN || 15),
+            cooldownHours: Number(process.env.REPLAY_SIGNAL_COOLDOWN_HOURS || 6),
+            outcomeHours: Number(process.env.REPLAY_OUTCOME_HOURS || 24),
+
+            stopAtr: 1.0,
+            targetMultiple: 1.8,
+
+            expectedBaseline: {
+              BELIT_EMRE: 1020,
+              BELIT_AKSEL: 123,
+            },
+          };
+
+          const BASE_TEAMS = {
+            BELIT_EMRE: ["BELIT", "EMRE"],
+            BELIT_AKSEL: ["BELIT", "AKSEL"],
+          };
+
+          function num(v) {
+            const n = Number(v);
+            return Number.isFinite(n) ? n : null;
+          }
+
+          function round(v, digits = 4) {
+            if (!Number.isFinite(v)) return null;
+            const m = 10 ** digits;
+            return Math.round(v * m) / m;
+          }
+
+          function iso(ts) {
+            return new Date(ts).toISOString();
+          }
+
+          function upperIndex(rows, timestamp, key = "closeTime") {
+            let lo = 0;
+            let hi = rows.length;
+
+            while (lo < hi) {
+              const mid = Math.floor((lo + hi) / 2);
+
+              if (Number(rows[mid]?.[key]) <= timestamp) {
+                lo = mid + 1;
+              } else {
+                hi = mid;
+              }
+            }
+
+            return lo;
+          }
+
+          function sliceUntil(rows, timestamp, limit) {
+            const end = upperIndex(rows, timestamp, "closeTime");
+            return rows.slice(Math.max(0, end - limit), end);
+          }
+
+          function sliceTsUntil(rows, timestamp, limit = 32) {
+            let lo = 0;
+            let hi = rows.length;
+
+            while (lo < hi) {
+              const mid = Math.floor((lo + hi) / 2);
+
+              if (Number(rows[mid]?.ts) <= timestamp) {
+                lo = mid + 1;
+              } else {
+                hi = mid;
+              }
+            }
+
+            return rows.slice(Math.max(0, lo - limit), lo);
+          }
+
+          function aggregateCandles(rows, minutes) {
+            const bucketMs = minutes * MINUTE;
+            const expected = minutes / 5;
+            const groups = new Map();
+
+            for (const row of rows) {
+              const bucket = Math.floor(row.openTime / bucketMs) * bucketMs;
+
+              if (!groups.has(bucket)) {
+                groups.set(bucket, []);
+              }
+
+              groups.get(bucket).push(row);
+            }
+
+            const out = [];
+
+            for (const [bucket, part] of groups) {
+              part.sort((a, b) => a.openTime - b.openTime);
+
+              if (part.length < expected) {
+                continue;
+              }
+
+              const first = part[0];
+              const last = part.at(-1);
+
+              out.push({
+                openTime: bucket,
+                closeTime: bucket + bucketMs - 1,
+                open: first.open,
+                high: Math.max(...part.map((x) => x.high)),
+                low: Math.min(...part.map((x) => x.low)),
+                close: last.close,
+                volume: part.reduce((s, x) => s + (num(x.volume) ?? 0), 0),
+                quoteVolume: part.reduce(
+                  (s, x) => s + (num(x.quoteVolume) ?? 0),
+                  0
+                ),
+              });
+            }
+
+            return out.sort((a, b) => a.openTime - b.openTime);
+          }
+
+          function addVolumeState(rows) {
+            let cumulative = 0;
+            let rolling = 0;
+            let left = 0;
+
+            const out = [];
+
+            for (let i = 0; i < rows.length; i++) {
+              const row = rows[i];
+              const q = num(row.quoteVolume) ?? 0;
+
+              cumulative += q;
+              rolling += q;
+
+              const cutoff = row.closeTime - DAY;
+
+              while (
+                left < i &&
+                rows[left].closeTime < cutoff
+              ) {
+                rolling -= num(rows[left].quoteVolume) ?? 0;
+                left++;
+              }
+
+              out.push({
+                ...row,
+                cumulativeQuote: cumulative,
+                quoteVolume24h: Math.max(0, rolling),
+              });
+            }
+
+            return out;
+          }
+
+          function radarStructureHints(candles15m) {
+            if (candles15m.length < 22) {
+              return {
+                compressionRatio: null,
+                distanceToBreakoutPct: null,
+              };
+            }
+
+            const latest = candles15m.at(-1);
+            const recent = candles15m.slice(-6);
+            const prior = candles15m.slice(-21, -6);
+
+            const recentRange =
+              Math.max(...recent.map((x) => x.high)) -
+              Math.min(...recent.map((x) => x.low));
+
+            const priorRange =
+              Math.max(...prior.map((x) => x.high)) -
+              Math.min(...prior.map((x) => x.low));
+
+            const compressionRatio =
+              priorRange > 0 ? recentRange / priorRange : null;
+
+            const boundaryRows = candles15m.slice(-21, -1);
+
+            const highBoundary = Math.max(
+              ...boundaryRows.map((x) => x.high)
+            );
+
+            const lowBoundary = Math.min(
+              ...boundaryRows.map((x) => x.low)
+            );
+
+            const momentumRef = candles15m.at(-5)?.close;
+
+            const bullish =
+              momentumRef > 0
+                ? latest.close >= momentumRef
+                : true;
+
+            const boundary = bullish ? highBoundary : lowBoundary;
+
+            const distanceToBreakoutPct =
+              latest.close > 0
+                ? (Math.abs(boundary - latest.close) / latest.close) * 100
+                : null;
+
+            return {
+              compressionRatio: round(compressionRatio, 4),
+              distanceToBreakoutPct: round(distanceToBreakoutPct, 4),
+            };
+          }
+
+          function trueRange(rows, index) {
+            const row = rows[index];
+
+            if (index === 0) {
+              return row.high - row.low;
+            }
+
+            const prevClose = rows[index - 1].close;
+
+            return Math.max(
+              row.high - row.low,
+              Math.abs(row.high - prevClose),
+              Math.abs(row.low - prevClose)
+            );
+          }
+
+          function atr(rows, period = 14) {
+            if (!Array.isArray(rows) || rows.length <= period) {
+              return null;
+            }
+
+            const start = Math.max(1, rows.length - period);
+            const values = [];
+
+            for (let i = start; i < rows.length; i++) {
+              values.push(trueRange(rows, i));
+            }
+
+            if (!values.length) {
+              return null;
+            }
+
+            return values.reduce((a, b) => a + b, 0) / values.length;
+          }
+
+          function commonGeometry(direction, entry, candles15m) {
+            const a = atr(candles15m, 14);
+
+            if (!(entry > 0) || !(a > 0)) {
+              return null;
+            }
+
+            const risk = a * CONFIG.stopAtr;
+
+            if (!(risk > 0) || risk >= entry) {
+              return null;
+            }
+
+            if (direction === "LONG") {
+              return {
+                entry,
+                stop: entry - risk,
+                tp1: entry + risk * CONFIG.targetMultiple,
+                stopDistancePct: (risk / entry) * 100,
+              };
+            }
+
+            if (direction === "SHORT") {
+              return {
+                entry,
+                stop: entry + risk,
+                tp1: entry - risk * CONFIG.targetMultiple,
+                stopDistancePct: (risk / entry) * 100,
+              };
+            }
+
+            return null;
+          }
+
+          function evaluateOutcome(signal, fiveMinuteRows) {
+            const timestamp = signal.timestampMs;
+            const { direction, entry, stop, tp1 } = signal;
+
+            const risk = Math.abs(entry - stop);
+
+            if (!(risk > 0)) {
+              return {
+                outcome: "INVALID_RISK",
+                resultR: null,
+              };
+            }
+
+            const endTime =
+              timestamp + CONFIG.outcomeHours * HOUR;
+
+            const startIndex = upperIndex(
+              fiveMinuteRows,
+              timestamp,
+              "closeTime"
+            );
+
+            let resultR = null;
+            let firstTouch = "TIMEOUT";
+            let finalClose = entry;
+
+            for (
+              let i = startIndex;
+              i < fiveMinuteRows.length;
+              i++
+            ) {
+              const bar = fiveMinuteRows[i];
+
+              if (bar.closeTime > endTime) {
+                break;
+              }
+
+              finalClose = bar.close;
+
+              const stopHit =
+                direction === "LONG"
+                  ? bar.low <= stop
+                  : bar.high >= stop;
+
+              const tp1Hit =
+                direction === "LONG"
+                  ? bar.high >= tp1
+                  : bar.low <= tp1;
+
+              // Conservative same-candle convention.
+              if (stopHit) {
+                firstTouch = "STOP";
+                resultR = -1;
+                break;
+              }
+
+              if (tp1Hit) {
+                firstTouch = "TP1";
+                resultR = CONFIG.targetMultiple;
+                break;
+              }
+            }
+
+            if (firstTouch === "TIMEOUT") {
+              const signed =
+                direction === "LONG"
+                  ? finalClose - entry
+                  : entry - finalClose;
+
+              resultR = signed / risk;
+            }
+
+            return {
+              outcome: firstTouch,
+              resultR: round(resultR, 4),
+            };
+          }
+
+          function maxDrawdown(values) {
+            let equity = 0;
+            let peak = 0;
+            let maxDD = 0;
+
+            for (const value of values) {
+              if (!Number.isFinite(value)) {
+                continue;
+              }
+
+              equity += value;
+              peak = Math.max(peak, equity);
+              maxDD = Math.max(maxDD, peak - equity);
+            }
+
+            return maxDD;
+          }
+
+          function average(values) {
+            const clean = values.filter(Number.isFinite);
+
+            if (!clean.length) {
+              return null;
+            }
+
+            return clean.reduce((a, b) => a + b, 0) / clean.length;
+          }
+
+          function stats(events) {
+            const ordered = [...events].sort(
+              (a, b) => a.timestampMs - b.timestampMs
+            );
+
+            const values = ordered
+              .map((x) => num(x.resultR))
+              .filter(Number.isFinite);
+
+            const wins = values.filter((x) => x > 0);
+            const losses = values.filter((x) => x < 0);
+            const flats = values.filter((x) => x === 0);
+
+            const grossWin = wins.reduce((a, b) => a + b, 0);
+            const grossLoss = Math.abs(
+              losses.reduce((a, b) => a + b, 0)
+            );
+            const total = values.reduce((a, b) => a + b, 0);
+
+            return {
+              signals: ordered.length,
+              resolved: values.length,
+              wins: wins.length,
+              losses: losses.length,
+              flats: flats.length,
+
+              winRatePct:
+                values.length
+                  ? round((wins.length / values.length) * 100, 2)
+                  : null,
+
+              avgComparisonPctPointsAt1Risk:
+                values.length
+                  ? round(total / values.length, 4)
+                  : null,
+
+              cumulativeComparisonPctPointsAt1Risk:
+                round(total, 4),
+
+              maxDrawdownComparisonPctPointsAt1Risk:
+                round(maxDrawdown(values), 4),
+
+              profitFactor:
+                grossLoss > 0
+                  ? round(grossWin / grossLoss, 4)
+                  : grossWin > 0
+                  ? 999
+                  : null,
+
+              avgFlowScore: round(
+                average(
+                  ordered.map((x) => num(x.flow?.score))
+                ),
+                4
+              ),
+
+              avgDirectionalPressureScore: round(
+                average(
+                  ordered.map((x) =>
+                    num(x.flow?.directionalPressureScore)
+                  )
+                ),
+                4
+              ),
+
+              avgFlowCoverage: round(
+                average(
+                  ordered.map((x) => num(x.flow?.coverage))
+                ),
+                4
+              ),
+            };
+          }
+
+          function grouped(events, selector) {
+            const map = new Map();
+
+            for (const event of events) {
+              const key = selector(event);
+
+              if (!map.has(key)) {
+                map.set(key, []);
+              }
+
+              map.get(key).push(event);
+            }
+
+            return Object.fromEntries(
+              [...map.entries()]
+                .sort(([a], [b]) =>
+                  String(a).localeCompare(String(b))
+                )
+                .map(([key, rows]) => [
+                  key,
+                  stats(rows),
+                ])
+            );
+          }
+
+          function quarterSummary(events) {
+            const totalMs =
+              CONFIG.replayEnd - CONFIG.replayStart + 1;
+
+            const quarterMs = totalMs / 4;
+            const out = {};
+
+            for (let i = 0; i < 4; i++) {
+              const start =
+                CONFIG.replayStart + i * quarterMs;
+
+              const end =
+                i === 3
+                  ? CONFIG.replayEnd
+                  : CONFIG.replayStart +
+                    (i + 1) * quarterMs -
+                    1;
+
+              const rows = events.filter(
+                (x) =>
+                  x.timestampMs >= start &&
+                  x.timestampMs <= end
+              );
+
+              out[`Q${i + 1}`] = {
+                start: iso(start),
+                end: iso(end),
+                ...stats(rows),
+              };
+            }
+
+            return out;
+          }
+
+          function moduleSignals(ctx) {
+            const radar = analyzeV4Radar({
+              symbol: ctx.symbol,
+              nowTs: ctx.t,
+              snapshots: ctx.snapshots,
+              quoteVolume24h:
+                ctx.latest5.quoteVolume24h,
+              spreadPct: null,
+              compressionRatio:
+                ctx.hints.compressionRatio,
+              distanceToBreakoutPct:
+                ctx.hints.distanceToBreakoutPct,
+            });
+
+            const direction = analyzeV4Direction({
+              symbol: ctx.symbol,
+              radarDirection: "NEUTRAL",
+              candles4h: ctx.c4h,
+              candles12h: ctx.c12h,
+              candles1d: ctx.c1d,
+            });
+
+            const structure = analyzeV4Structure({
+              symbol: ctx.symbol,
+              direction: "NEUTRAL",
+              candles15m: ctx.c15,
+              candles1h: ctx.c1h,
+              candles4h: ctx.c4h,
+            });
+
+            return {
+              BELIT:
+                radar.eligible &&
+                ["LONG", "SHORT"].includes(radar.direction) &&
+                num(radar.score) >= V4_RADAR_CFG.strongScore
+                  ? {
+                      direction: radar.direction,
+                      score: num(radar.score),
+                      status: radar.status,
+                    }
+                  : null,
+
+              EMRE:
+                !direction.hardVeto &&
+                ["LONG", "SHORT"].includes(direction.direction) &&
+                num(direction.score) >=
+                  V4_DIRECTION_CFG.strongDirectionScore
+                  ? {
+                      direction: direction.direction,
+                      score: num(direction.score),
+                      status: direction.status,
+                    }
+                  : null,
+
+              AKSEL:
+                ["LONG", "SHORT"].includes(structure.direction) &&
+                num(structure.score) >=
+                  V4_STRUCTURE_CFG.strongScore
+                  ? {
+                      direction: structure.direction,
+                      score: num(structure.score),
+                      status: structure.status,
+                    }
+                  : null,
+            };
+          }
+
+          function agreement(members, moduleMap) {
+            const signals = members.map(
+              (member) => moduleMap[member]
+            );
+
+            if (signals.some((x) => !x)) {
+              return null;
+            }
+
+            const directions = new Set(
+              signals.map((x) => x.direction)
+            );
+
+            if (directions.size !== 1) {
+              return null;
+            }
+
+            return {
+              direction: signals[0].direction,
+            };
+          }
+
+          async function loadFlowProxy(symbol) {
+            const file = `flow_proxy_data/${symbol.replaceAll("-", "")}_flow_proxy.json.gz`;
+            const compressed = await readFile(file);
+            const json = gunzipSync(compressed).toString("utf8");
+            const data = JSON.parse(json);
+
+            return {
+              spotCvd: Array.isArray(data.spotCvd) ? data.spotCvd : [],
+              futuresCvd:
+                Array.isArray(data.futuresCvd) ? data.futuresCvd : [],
+              openInterest:
+                Array.isArray(data.openInterest) ? data.openInterest : [],
+            };
+          }
+
+          function flowAt(
+            symbol,
+            direction,
+            timestamp,
+            latestPriceRows,
+            proxy
+          ) {
+            const priceSnapshots = latestPriceRows.map(
+              (x) => ({
+                ts: x.closeTime,
+                price: x.close,
+              })
+            );
+
+            return analyzeV4Flow({
+              symbol,
+              direction,
+              nowTs: timestamp,
+              priceSnapshots,
+              spotCvd: sliceTsUntil(
+                proxy.spotCvd,
+                timestamp,
+                32
+              ),
+              futuresCvd: sliceTsUntil(
+                proxy.futuresCvd,
+                timestamp,
+                32
+              ),
+              openInterest: sliceTsUntil(
+                proxy.openInterest,
+                timestamp,
+                32
+              ),
+              fundingRate: null,
+              liquidations: [],
+            });
+          }
+
+          function flowSnapshot(flow) {
+            return {
+              score: num(flow?.score),
+              status: flow?.status ?? null,
+              coverage: num(flow?.coverage),
+              directionalPressureScore:
+                num(flow?.directionalPressureScore),
+              dominantSide:
+                flow?.dominantSide ?? null,
+              pressureStrength:
+                flow?.pressureStrength ?? null,
+              severeRisk:
+                Boolean(flow?.severeRisk),
+            };
+          }
+
+          async function replaySymbol(symbol) {
+            console.log(
+              `\n========== ${symbol} DORUK FLOW CHEMISTRY ==========`
+            );
+
+            const raw = await loadFrozenFiveMinuteRows(symbol);
+            const five = addVolumeState(raw);
+
+            const fifteen = aggregateCandles(five, 15);
+            const hourly = aggregateCandles(five, 60);
+            const four = aggregateCandles(five, 240);
+            const twelve = aggregateCandles(five, 720);
+            const daily = aggregateCandles(five, 1440);
+
+            const proxy = await loadFlowProxy(symbol);
+
+            const replayBars = fifteen.filter(
+              (x) =>
+                x.closeTime >= CONFIG.replayStart &&
+                x.closeTime <= CONFIG.replayEnd
+            );
+
+            const events = [];
+            const lastSignal = new Map();
+
+            const stepBars = Math.max(
+              1,
+              CONFIG.stepMinutes / 15
+            );
+
+            for (
+              let index = 0;
+              index < replayBars.length;
+              index++
+            ) {
+              if (index % stepBars !== 0) {
+                continue;
+              }
+
+              const t = replayBars[index].closeTime;
+
+              const c5 = sliceUntil(five, t, 320);
+              const c15 = sliceUntil(fifteen, t, 140);
+              const c1h = sliceUntil(hourly, t, 140);
+              const c4h = sliceUntil(four, t, 140);
+              const c12h = sliceUntil(twelve, t, 110);
+              const c1d = sliceUntil(daily, t, 110);
+
+              const latest5 = c5.at(-1);
+
+              if (!latest5) {
+                continue;
+              }
+
+              const hints = radarStructureHints(c15);
+
+              const snapshots = c5.map((x) => ({
+                ts: x.closeTime,
+                price: x.close,
+                quoteVolume24h: x.cumulativeQuote,
+              }));
+
+              const ctx = {
+                symbol,
+                t,
+                latest5,
+                c15,
+                c1h,
+                c4h,
+                c12h,
+                c1d,
+                hints,
+                snapshots,
+              };
+
+              const modules = moduleSignals(ctx);
+
+              for (
+                const [teamName, members] of
+                Object.entries(BASE_TEAMS)
+              ) {
+                const a = agreement(members, modules);
+
+                if (!a) {
+                  continue;
+                }
+
+                const key =
+                  `${teamName}:${symbol}:${a.direction}`;
+
+                const previous = lastSignal.get(key);
+
+                if (
+                  previous &&
+                  t - previous <
+                    CONFIG.cooldownHours * HOUR
+                ) {
+                  continue;
+                }
+
+                const geometry = commonGeometry(
+                  a.direction,
+                  latest5.close,
+                  c15
+                );
+
+                if (!geometry) {
+                  continue;
+                }
+
+                lastSignal.set(key, t);
+
+                const flow = flowAt(
+                  symbol,
+                  a.direction,
+                  t,
+                  c5,
+                  proxy
+                );
+
+                const event = {
+                  version: VERSION,
+                  team: teamName,
+                  members,
+                  timestamp: iso(t),
+                  timestampMs: t,
+                  symbol,
+                  direction: a.direction,
+                  entry: geometry.entry,
+                  stop: geometry.stop,
+                  tp1: geometry.tp1,
+                  stopDistancePct: round(
+                    geometry.stopDistancePct,
+                    4
+                  ),
+                  flow: flowSnapshot(flow),
+                };
+
+                Object.assign(
+                  event,
+                  evaluateOutcome(event, five)
+                );
+
+                events.push(event);
+              }
+            }
+
+            return events;
+          }
+
+          function variantPass(event, variant) {
+            const score = num(event.flow?.score);
+            const pressure =
+              num(event.flow?.directionalPressureScore);
+
+            if (variant === "BASELINE") {
+              return true;
+            }
+
+            if (variant === "BLOCK_FLOW_AGAINST") {
+              return (
+                score !== null &&
+                score >= V4_FLOW_CFG.againstScore
+              );
+            }
+
+            if (variant === "FLOW_SUPPORTIVE") {
+              return (
+                score !== null &&
+                score >= V4_FLOW_CFG.supportiveScore
+              );
+            }
+
+            if (variant === "FLOW_STRONG") {
+              return (
+                score !== null &&
+                score >= V4_FLOW_CFG.strongScore
+              );
+            }
+
+            if (variant === "PRESSURE_STRONG") {
+              return (
+                pressure !== null &&
+                pressure >=
+                  V4_FLOW_CFG.pressureStrongScore
+              );
+            }
+
+            if (variant === "FLOW_AND_PRESSURE_STRONG") {
+              return (
+                score !== null &&
+                pressure !== null &&
+                score >= V4_FLOW_CFG.strongScore &&
+                pressure >=
+                  V4_FLOW_CFG.pressureStrongScore
+              );
+            }
+
+            return false;
+          }
+
+          function compareToBaseline(
+            baseline,
+            variant
+          ) {
+            return {
+              retentionPct:
+                baseline.signals
+                  ? round(
+                      (variant.signals / baseline.signals) * 100,
+                      2
+                    )
+                  : null,
+
+              winRateDeltaPctPoints:
+                round(
+                  (variant.winRatePct ?? 0) -
+                    (baseline.winRatePct ?? 0),
+                  2
+                ),
+
+              avgComparisonDeltaPctPoints:
+                round(
+                  (variant.avgComparisonPctPointsAt1Risk ?? 0) -
+                    (baseline.avgComparisonPctPointsAt1Risk ?? 0),
+                  4
+                ),
+
+              maxDrawdownDeltaPctPoints:
+                round(
+                  (variant.maxDrawdownComparisonPctPointsAt1Risk ?? 0) -
+                    (baseline.maxDrawdownComparisonPctPointsAt1Risk ?? 0),
+                  4
+                ),
+            };
+          }
+
+          async function main() {
+            const frozenManifest =
+              await loadFrozenManifest();
+
+            const proxyManifest = JSON.parse(
+              await readFile(
+                "flow_proxy_data/manifest.json",
+                "utf8"
+              )
+            );
+
+            if (proxyManifest.integrityPass !== true) {
+              throw new Error(
+                "FLOW proxy manifest integrityPass is not true"
+              );
+            }
+
+            const allEvents = [];
+
+            for (const symbol of CONFIG.symbols) {
+              allEvents.push(
+                ...(await replaySymbol(symbol))
+              );
+            }
+
+            allEvents.sort((a, b) => {
+              if (a.timestampMs !== b.timestampMs) {
+                return a.timestampMs - b.timestampMs;
+              }
+
+              return a.team.localeCompare(b.team);
+            });
+
+            for (
+              const [team, expected] of
+              Object.entries(CONFIG.expectedBaseline)
+            ) {
+              const actual = allEvents.filter(
+                (x) => x.team === team
+              ).length;
+
+              if (actual !== expected) {
+                throw new Error(
+                  `Baseline reproduction failed ${team}: ${actual}/${expected}`
+                );
+              }
+            }
+
+            const variants = [
+              "BASELINE",
+              "BLOCK_FLOW_AGAINST",
+              "FLOW_SUPPORTIVE",
+              "FLOW_STRONG",
+              "PRESSURE_STRONG",
+              "FLOW_AND_PRESSURE_STRONG",
+            ];
+
+            const teams = {};
+
+            for (
+              const teamName of
+              Object.keys(BASE_TEAMS)
+            ) {
+              const baseRows = allEvents.filter(
+                (x) => x.team === teamName
+              );
+
+              const baselineStats = stats(baseRows);
+
+              teams[teamName] = {
+                baseline: {
+                  overall: baselineStats,
+                  quarters: quarterSummary(baseRows),
+                  bySymbol: grouped(
+                    baseRows,
+                    (x) => x.symbol
+                  ),
+                  byDirection: grouped(
+                    baseRows,
+                    (x) => x.direction
+                  ),
+                },
+
+                variants: {},
+              };
+
+              for (const variant of variants) {
+                const rows = baseRows.filter(
+                  (x) => variantPass(x, variant)
+                );
+
+                const s = stats(rows);
+
+                teams[teamName].variants[variant] = {
+                  overall: s,
+                  vsBaseline: compareToBaseline(
+                    baselineStats,
+                    s
+                  ),
+                  positiveQuarterCount:
+                    Object.values(
+                      quarterSummary(rows)
+                    ).filter(
+                      (q) =>
+                        num(
+                          q.cumulativeComparisonPctPointsAt1Risk
+                        ) > 0
+                    ).length,
+                  quarters: quarterSummary(rows),
+                  bySymbol: grouped(
+                    rows,
+                    (x) => x.symbol
+                  ),
+                  byDirection: grouped(
+                    rows,
+                    (x) => x.direction
+                  ),
+                };
+              }
+            }
+
+            const ranking = [];
+
+            for (
+              const [teamName, team] of
+              Object.entries(teams)
+            ) {
+              for (
+                const [variant, result] of
+                Object.entries(team.variants)
+              ) {
+                ranking.push({
+                  team: teamName,
+                  variant,
+                  signals: result.overall.signals,
+                  winRatePct: result.overall.winRatePct,
+                  avgComparisonPctPointsAt1Risk:
+                    result.overall.avgComparisonPctPointsAt1Risk,
+                  profitFactor:
+                    result.overall.profitFactor,
+                  maxDrawdownComparisonPctPointsAt1Risk:
+                    result.overall
+                      .maxDrawdownComparisonPctPointsAt1Risk,
+                  retentionPct:
+                    result.vsBaseline.retentionPct,
+                  positiveQuarterCount:
+                    result.positiveQuarterCount,
+                });
+              }
+            }
+
+            ranking.sort(
+              (a, b) =>
+                (b.avgComparisonPctPointsAt1Risk ?? -Infinity) -
+                (a.avgComparisonPctPointsAt1Risk ?? -Infinity)
+            );
+
+            const output = {
+              version: VERSION,
+              mode: "HISTORICAL_REPLAY_ONLY",
+
+              purpose:
+                "Test whether Doruk FLOW_2 adds value to the two previously winning chemistry baselines without changing their timestamps or cooldown population.",
+
+              frozenDataset: {
+                datasetId: frozenManifest.datasetId,
+                rootContentSha256:
+                  frozenManifest.rootContentSha256,
+              },
+
+              flowProxyDataset: {
+                version: proxyManifest.version,
+                source: proxyManifest.source,
+                window: proxyManifest.window,
+                expectedFlowCoverage:
+                  proxyManifest.expectedFlowCoverage,
+                families: proxyManifest.families,
+              },
+
+              replayWindow: {
+                start: iso(CONFIG.replayStart),
+                end: iso(CONFIG.replayEnd),
+                days: round(
+                  (CONFIG.replayEnd -
+                    CONFIG.replayStart +
+                    1) /
+                    DAY,
+                  2
+                ),
+              },
+
+              baselineReproduction: {
+                BELIT_EMRE: CONFIG.expectedBaseline.BELIT_EMRE,
+                BELIT_AKSEL: CONFIG.expectedBaseline.BELIT_AKSEL,
+                exactPopulationAsserted: true,
+              },
+
+              thresholds: {
+                BELIT:
+                  V4_RADAR_CFG.strongScore,
+                EMRE:
+                  V4_DIRECTION_CFG.strongDirectionScore,
+                AKSEL:
+                  V4_STRUCTURE_CFG.strongScore,
+                DORUK_FLOW_AGAINST:
+                  V4_FLOW_CFG.againstScore,
+                DORUK_FLOW_SUPPORTIVE:
+                  V4_FLOW_CFG.supportiveScore,
+                DORUK_FLOW_STRONG:
+                  V4_FLOW_CFG.strongScore,
+                DORUK_PRESSURE_STRONG:
+                  V4_FLOW_CFG.pressureStrongScore,
+                note:
+                  "All thresholds are pre-existing module semantics. No threshold was optimized after seeing these results.",
+              },
+
+              integrity: {
+                futureDataUsedForSignals: false,
+                exactBaselinePopulationPreserved: true,
+                variantsAreSubsetsOfBaseline: true,
+                independentVariantCooldownsUsed: false,
+                flowProxyUsesSpotKlineTakerImbalance: true,
+                flowProxyUsesFuturesKlineTakerImbalance: true,
+                openInterestUsesBinancePublicMetrics: true,
+                fundingInvented: false,
+                liquidationsInvented: false,
+                productionStrategyFilesModified: false,
+                scannerEnabled: false,
+                paperOrdersEnabled: false,
+                realOrdersEnabled: false,
+              },
+
+              ranking,
+              teams,
+
+              caveats: [
+                "This is a Doruk FLOW research proxy, not a venue-native BingX FLOW replay.",
+                "Spot/futures CVD is approximated from signed 5m kline taker quote imbalance; it is not tick-level CVD.",
+                "Open interest is historical Binance USD-M public metrics.",
+                "Funding and liquidation history are omitted and therefore neutral, not guessed.",
+                "DOGE had a prior Binance-vs-BingX normalized-volume proxy caveat; treat DOGE flow conclusions cautiously.",
+                "Fees, slippage, funding PnL, concurrent positions, leverage, compounding and cross-coin correlation are not modeled.",
+                "This is historical research only and does not grant PAPER or LIVE permission."
+              ],
+            };
+
+            await mkdir(
+              "artifacts_flow_chemistry",
+              { recursive: true }
+            );
+
+            await writeFile(
+              "artifacts_flow_chemistry/v4_doruk_flow_chemistry_summary.json",
+              JSON.stringify(output, null, 2),
+              "utf8"
+            );
+
+            await writeFile(
+              "artifacts_flow_chemistry/v4_doruk_flow_chemistry_events.json",
+              JSON.stringify(allEvents, null, 2),
+              "utf8"
+            );
+
+            console.log(
+              "===== V4 DORUK FLOW CHEMISTRY REPLAY ====="
+            );
+
+            console.log(
+              JSON.stringify(
+                {
+                  integrity: output.integrity,
+                  baselineReproduction:
+                    output.baselineReproduction,
+                  thresholds: output.thresholds,
+                  ranking: output.ranking,
+                },
+                null,
+                2
+              )
+            );
+          }
+
+          main().catch((error) => {
+            console.error(
+              "V4 DORUK FLOW CHEMISTRY FAILED"
+            );
+            console.error(
+              error?.stack || error
+            );
+            process.exitCode = 1;
+          });
+          NODE
+
+          node --check v4_doruk_flow_chemistry_replay.mjs
+
+      - name: Run Doruk Flow Chemistry Replay
+        run: node v4_doruk_flow_chemistry_replay.mjs
+
+      - name: Show Scoreboard
+        if: always()
+        shell: bash
+        run: |
+          if [ -f artifacts_flow_chemistry/v4_doruk_flow_chemistry_summary.json ]; then
+            python -c 'import json; x=json.load(open("artifacts_flow_chemistry/v4_doruk_flow_chemistry_summary.json")); print(json.dumps({"integrity":x["integrity"],"baselineReproduction":x["baselineReproduction"],"thresholds":x["thresholds"],"ranking":x["ranking"]}, indent=2))'
+          else
+            echo "Doruk Flow chemistry summary was not generated."
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-doruk-flow-chemistry-results
+          path: |
+            artifacts_flow_chemistry/v4_doruk_flow_chemistry_summary.json
+            artifacts_flow_chemistry/v4_doruk_flow_chemistry_events.json
+            flow_proxy_data/manifest.json
+            flow_proxy_data/*.json.gz
+          if-no-files-found: warn
+          retention-days: 30
