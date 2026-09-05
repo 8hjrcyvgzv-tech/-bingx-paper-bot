@@ -1,0 +1,1547 @@
+name: V4 Chemistry Replay
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - ".github/workflows/v4-chemistry-replay.yml"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      V4_FROZEN_DATASET_ID: V4_CORE6_BINANCE_UM_5M_20260215_20260903_EBECBEDEEE03
+      V4_FROZEN_ROOT_SHA256: ebecbedeee03954dc9a8ff5fdabf764ebf92fb8cd90b30a659f8cbeaf9d67965
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_START: "2026-05-26T00:00:00.000Z"
+      REPLAY_END: "2026-09-02T23:59:59.999Z"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download Frozen Dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: v4-frozen-core6-200d-dataset
+          path: frozen_dataset
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33924848219
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f v4_radar.js
+          test -f v4_direction.js
+          test -f v4_structure.js
+          test -f v4_frozen_data_provider.mjs
+          test -f frozen_dataset/manifest.json
+
+          grep -q 'strongScore: 7.0' v4_radar.js
+          grep -q 'strongDirectionScore: 7.0' v4_direction.js
+          grep -q 'strongScore: 7.0' v4_structure.js
+
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']'             v4_radar.js             v4_direction.js             v4_structure.js             v4_frozen_data_provider.mjs
+
+          echo "V4 CHEMISTRY LAB: HISTORICAL READ-ONLY PASS"
+
+      - name: Create Chemistry Replay Lab
+        shell: bash
+        run: |
+          cat > v4_chemistry_replay.mjs <<'NODE'
+          import { mkdir, writeFile } from "node:fs/promises";
+
+          import {
+            analyzeV4Radar,
+            V4_RADAR_CFG,
+          } from "./v4_radar.js";
+
+          import {
+            analyzeV4Direction,
+            V4_DIRECTION_CFG,
+          } from "./v4_direction.js";
+
+          import {
+            analyzeV4Structure,
+            V4_STRUCTURE_CFG,
+          } from "./v4_structure.js";
+
+          import {
+            loadFrozenManifest,
+            loadFrozenFiveMinuteRows,
+          } from "./v4_frozen_data_provider.mjs";
+
+          const VERSION = "V4_CHEMISTRY_REPLAY_1";
+          const DAY = 24 * 60 * 60 * 1000;
+          const HOUR = 60 * 60 * 1000;
+          const MINUTE = 60 * 1000;
+
+          const CONFIG = {
+            symbols: String(
+              process.env.REPLAY_SYMBOLS ||
+                "BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT"
+            )
+              .split(",")
+              .map((x) => x.trim().toUpperCase())
+              .filter(Boolean),
+
+            replayStart: Date.parse(
+              process.env.REPLAY_START || "2026-05-26T00:00:00.000Z"
+            ),
+
+            replayEnd: Date.parse(
+              process.env.REPLAY_END || "2026-09-02T23:59:59.999Z"
+            ),
+
+            stepMinutes: Number(process.env.REPLAY_STEP_MIN || 15),
+            cooldownHours: Number(process.env.REPLAY_SIGNAL_COOLDOWN_HOURS || 6),
+            outcomeHours: Number(process.env.REPLAY_OUTCOME_HOURS || 24),
+
+            stopAtr: 1.0,
+            targetMultiple: 1.8,
+          };
+
+          const TEAMS = {
+            BELIT: ["BELIT"],
+            EMRE: ["EMRE"],
+            AKSEL: ["AKSEL"],
+            BELIT_EMRE: ["BELIT", "EMRE"],
+            BELIT_AKSEL: ["BELIT", "AKSEL"],
+            EMRE_AKSEL: ["EMRE", "AKSEL"],
+            BELIT_EMRE_AKSEL: ["BELIT", "EMRE", "AKSEL"],
+          };
+
+          function num(v) {
+            const n = Number(v);
+            return Number.isFinite(n) ? n : null;
+          }
+
+          function round(v, digits = 4) {
+            if (!Number.isFinite(v)) return null;
+            const m = 10 ** digits;
+            return Math.round(v * m) / m;
+          }
+
+          function iso(ts) {
+            return new Date(ts).toISOString();
+          }
+
+          function upperIndex(rows, timestamp) {
+            let lo = 0;
+            let hi = rows.length;
+
+            while (lo < hi) {
+              const mid = Math.floor((lo + hi) / 2);
+
+              if (rows[mid].closeTime <= timestamp) {
+                lo = mid + 1;
+              } else {
+                hi = mid;
+              }
+            }
+
+            return lo;
+          }
+
+          function sliceUntil(rows, timestamp, limit) {
+            const end = upperIndex(rows, timestamp);
+            return rows.slice(Math.max(0, end - limit), end);
+          }
+
+          function aggregateCandles(rows, minutes) {
+            const bucketMs = minutes * MINUTE;
+            const expected = minutes / 5;
+            const groups = new Map();
+
+            for (const row of rows) {
+              const bucket = Math.floor(row.openTime / bucketMs) * bucketMs;
+
+              if (!groups.has(bucket)) {
+                groups.set(bucket, []);
+              }
+
+              groups.get(bucket).push(row);
+            }
+
+            const out = [];
+
+            for (const [bucket, part] of groups) {
+              part.sort((a, b) => a.openTime - b.openTime);
+
+              if (part.length < expected) {
+                continue;
+              }
+
+              const first = part[0];
+              const last = part.at(-1);
+
+              out.push({
+                openTime: bucket,
+                closeTime: bucket + bucketMs - 1,
+                open: first.open,
+                high: Math.max(...part.map((x) => x.high)),
+                low: Math.min(...part.map((x) => x.low)),
+                close: last.close,
+                volume: part.reduce((s, x) => s + (num(x.volume) ?? 0), 0),
+                quoteVolume: part.reduce(
+                  (s, x) => s + (num(x.quoteVolume) ?? 0),
+                  0
+                ),
+              });
+            }
+
+            return out.sort((a, b) => a.openTime - b.openTime);
+          }
+
+          function addVolumeState(rows) {
+            let cumulative = 0;
+            let rolling = 0;
+            let left = 0;
+
+            const out = [];
+
+            for (let i = 0; i < rows.length; i++) {
+              const row = rows[i];
+              const q = num(row.quoteVolume) ?? 0;
+
+              cumulative += q;
+              rolling += q;
+
+              const cutoff = row.closeTime - DAY;
+
+              while (left < i && rows[left].closeTime < cutoff) {
+                rolling -= num(rows[left].quoteVolume) ?? 0;
+                left++;
+              }
+
+              out.push({
+                ...row,
+                cumulativeQuote: cumulative,
+                quoteVolume24h: Math.max(0, rolling),
+              });
+            }
+
+            return out;
+          }
+
+          function radarStructureHints(candles15m) {
+            if (candles15m.length < 22) {
+              return {
+                compressionRatio: null,
+                distanceToBreakoutPct: null,
+              };
+            }
+
+            const latest = candles15m.at(-1);
+            const recent = candles15m.slice(-6);
+            const prior = candles15m.slice(-21, -6);
+
+            const recentRange =
+              Math.max(...recent.map((x) => x.high)) -
+              Math.min(...recent.map((x) => x.low));
+
+            const priorRange =
+              Math.max(...prior.map((x) => x.high)) -
+              Math.min(...prior.map((x) => x.low));
+
+            const compressionRatio =
+              priorRange > 0 ? recentRange / priorRange : null;
+
+            const boundaryRows = candles15m.slice(-21, -1);
+
+            const highBoundary = Math.max(
+              ...boundaryRows.map((x) => x.high)
+            );
+
+            const lowBoundary = Math.min(
+              ...boundaryRows.map((x) => x.low)
+            );
+
+            const momentumRef = candles15m.at(-5)?.close;
+
+            const bullish =
+              momentumRef > 0
+                ? latest.close >= momentumRef
+                : true;
+
+            const boundary = bullish ? highBoundary : lowBoundary;
+
+            const distanceToBreakoutPct =
+              latest.close > 0
+                ? (Math.abs(boundary - latest.close) / latest.close) * 100
+                : null;
+
+            return {
+              compressionRatio: round(compressionRatio, 4),
+              distanceToBreakoutPct: round(distanceToBreakoutPct, 4),
+            };
+          }
+
+          function trueRange(rows, index) {
+            const row = rows[index];
+
+            if (index === 0) {
+              return row.high - row.low;
+            }
+
+            const prevClose = rows[index - 1].close;
+
+            return Math.max(
+              row.high - row.low,
+              Math.abs(row.high - prevClose),
+              Math.abs(row.low - prevClose)
+            );
+          }
+
+          function atr(rows, period = 14) {
+            if (!Array.isArray(rows) || rows.length <= period) {
+              return null;
+            }
+
+            const start = Math.max(1, rows.length - period);
+            const values = [];
+
+            for (let i = start; i < rows.length; i++) {
+              values.push(trueRange(rows, i));
+            }
+
+            if (!values.length) {
+              return null;
+            }
+
+            return values.reduce((a, b) => a + b, 0) / values.length;
+          }
+
+          function commonGeometry(direction, entry, candles15m) {
+            const a = atr(candles15m, 14);
+
+            if (!(entry > 0) || !(a > 0)) {
+              return null;
+            }
+
+            const risk = a * CONFIG.stopAtr;
+
+            if (!(risk > 0) || risk >= entry) {
+              return null;
+            }
+
+            if (direction === "LONG") {
+              return {
+                entry,
+                stop: entry - risk,
+                tp1: entry + risk * CONFIG.targetMultiple,
+                stopDistancePct: (risk / entry) * 100,
+              };
+            }
+
+            if (direction === "SHORT") {
+              return {
+                entry,
+                stop: entry + risk,
+                tp1: entry - risk * CONFIG.targetMultiple,
+                stopDistancePct: (risk / entry) * 100,
+              };
+            }
+
+            return null;
+          }
+
+          function priceAfter(rows, timestamp, minutes) {
+            const target = timestamp + minutes * MINUTE;
+            const index = upperIndex(rows, target);
+
+            if (index <= 0) {
+              return null;
+            }
+
+            return rows[index - 1]?.close ?? null;
+          }
+
+          function directionalMove(direction, from, to) {
+            if (!(from > 0) || !(to > 0)) {
+              return null;
+            }
+
+            const raw = ((to - from) / from) * 100;
+            return direction === "SHORT" ? -raw : raw;
+          }
+
+          function evaluateOutcome(signal, fiveMinuteRows) {
+            const timestamp = signal.timestampMs;
+            const { direction, entry, stop, tp1 } = signal;
+
+            const risk = Math.abs(entry - stop);
+
+            if (!(risk > 0)) {
+              return {
+                outcome: "INVALID_RISK",
+                resultR: null,
+              };
+            }
+
+            const endTime =
+              timestamp + CONFIG.outcomeHours * HOUR;
+
+            const startIndex = upperIndex(
+              fiveMinuteRows,
+              timestamp
+            );
+
+            let resultR = null;
+            let firstTouch = "TIMEOUT";
+            let finalClose = entry;
+            let maxFavorable = 0;
+            let maxAdverse = 0;
+
+            for (
+              let i = startIndex;
+              i < fiveMinuteRows.length;
+              i++
+            ) {
+              const bar = fiveMinuteRows[i];
+
+              if (bar.closeTime > endTime) {
+                break;
+              }
+
+              finalClose = bar.close;
+
+              const favorable =
+                direction === "LONG"
+                  ? bar.high - entry
+                  : entry - bar.low;
+
+              const adverse =
+                direction === "LONG"
+                  ? entry - bar.low
+                  : bar.high - entry;
+
+              maxFavorable = Math.max(
+                maxFavorable,
+                favorable
+              );
+
+              maxAdverse = Math.max(
+                maxAdverse,
+                adverse
+              );
+
+              const stopHit =
+                direction === "LONG"
+                  ? bar.low <= stop
+                  : bar.high >= stop;
+
+              const tp1Hit =
+                direction === "LONG"
+                  ? bar.high >= tp1
+                  : bar.low <= tp1;
+
+              // Conservative replay convention:
+              // same 5m candle touching stop and target = stop first.
+              if (stopHit) {
+                firstTouch = "STOP";
+                resultR = -1;
+                break;
+              }
+
+              if (tp1Hit) {
+                firstTouch = "TP1";
+                resultR = CONFIG.targetMultiple;
+                break;
+              }
+            }
+
+            if (firstTouch === "TIMEOUT") {
+              const signed =
+                direction === "LONG"
+                  ? finalClose - entry
+                  : entry - finalClose;
+
+              resultR = signed / risk;
+            }
+
+            const p4h = priceAfter(
+              fiveMinuteRows,
+              timestamp,
+              240
+            );
+
+            const p24h = priceAfter(
+              fiveMinuteRows,
+              timestamp,
+              24 * 60
+            );
+
+            return {
+              outcome: firstTouch,
+              resultR: round(resultR, 4),
+              mfeR: round(maxFavorable / risk, 4),
+              maeR: round(maxAdverse / risk, 4),
+              after4hPct: round(
+                directionalMove(
+                  direction,
+                  entry,
+                  p4h
+                ),
+                4
+              ),
+              after24hPct: round(
+                directionalMove(
+                  direction,
+                  entry,
+                  p24h
+                ),
+                4
+              ),
+            };
+          }
+
+          function maxDrawdown(values) {
+            let equity = 0;
+            let peak = 0;
+            let maxDD = 0;
+
+            for (const value of values) {
+              if (!Number.isFinite(value)) {
+                continue;
+              }
+
+              equity += value;
+              peak = Math.max(peak, equity);
+              maxDD = Math.max(maxDD, peak - equity);
+            }
+
+            return maxDD;
+          }
+
+          function average(values) {
+            const clean = values.filter(Number.isFinite);
+
+            if (!clean.length) {
+              return null;
+            }
+
+            return clean.reduce((a, b) => a + b, 0) / clean.length;
+          }
+
+          function stats(events) {
+            const ordered = [...events].sort(
+              (a, b) => a.timestampMs - b.timestampMs
+            );
+
+            const values = ordered
+              .map((x) => num(x.resultR))
+              .filter(Number.isFinite);
+
+            const wins = values.filter((x) => x > 0);
+            const losses = values.filter((x) => x < 0);
+            const flats = values.filter((x) => x === 0);
+
+            const grossWin = wins.reduce(
+              (a, b) => a + b,
+              0
+            );
+
+            const grossLoss = Math.abs(
+              losses.reduce((a, b) => a + b, 0)
+            );
+
+            const total = values.reduce(
+              (a, b) => a + b,
+              0
+            );
+
+            return {
+              signals: ordered.length,
+              resolved: values.length,
+              wins: wins.length,
+              losses: losses.length,
+              flats: flats.length,
+
+              winRatePct:
+                values.length
+                  ? round(
+                      (wins.length / values.length) * 100,
+                      2
+                    )
+                  : null,
+
+              avgAccountPctAt1Risk:
+                values.length
+                  ? round(total / values.length, 4)
+                  : null,
+
+              cumulativeAccountPctPointsAt1Risk:
+                round(total, 4),
+
+              maxDrawdownPctPointsAt1Risk:
+                round(maxDrawdown(values), 4),
+
+              profitFactor:
+                grossLoss > 0
+                  ? round(grossWin / grossLoss, 4)
+                  : grossWin > 0
+                  ? 999
+                  : null,
+
+              avgStopDistancePct: round(
+                average(
+                  ordered.map((x) =>
+                    num(x.stopDistancePct)
+                  )
+                ),
+                4
+              ),
+
+              avgAfter4hMovePct: round(
+                average(
+                  ordered.map((x) =>
+                    num(x.after4hPct)
+                  )
+                ),
+                4
+              ),
+
+              positiveAfter4hPct:
+                ordered.length
+                  ? round(
+                      (
+                        ordered.filter(
+                          (x) =>
+                            num(x.after4hPct) >
+                            0
+                        ).length /
+                        ordered.filter(
+                          (x) =>
+                            Number.isFinite(
+                              num(x.after4hPct)
+                            )
+                        ).length
+                      ) * 100,
+                      2
+                    )
+                  : null,
+
+              avgAfter24hMovePct: round(
+                average(
+                  ordered.map((x) =>
+                    num(x.after24hPct)
+                  )
+                ),
+                4
+              ),
+
+              positiveAfter24hPct:
+                ordered.length
+                  ? round(
+                      (
+                        ordered.filter(
+                          (x) =>
+                            num(x.after24hPct) >
+                            0
+                        ).length /
+                        ordered.filter(
+                          (x) =>
+                            Number.isFinite(
+                              num(x.after24hPct)
+                            )
+                        ).length
+                      ) * 100,
+                      2
+                    )
+                  : null,
+
+              equivalent1000UsdScore: {
+                avgPerTradeUsd:
+                  values.length
+                    ? round((total / values.length) * 10, 2)
+                    : null,
+
+                cumulativeScoreUsd: round(
+                  total * 10,
+                  2
+                ),
+
+                maxDrawdownScoreUsd: round(
+                  maxDrawdown(values) * 10,
+                  2
+                ),
+              },
+            };
+          }
+
+          function grouped(events, selector) {
+            const map = new Map();
+
+            for (const event of events) {
+              const key = selector(event);
+
+              if (!map.has(key)) {
+                map.set(key, []);
+              }
+
+              map.get(key).push(event);
+            }
+
+            return Object.fromEntries(
+              [...map.entries()]
+                .sort(([a], [b]) =>
+                  String(a).localeCompare(
+                    String(b)
+                  )
+                )
+                .map(([key, rows]) => [
+                  key,
+                  stats(rows),
+                ])
+            );
+          }
+
+          function quarterSummary(events) {
+            const totalMs =
+              CONFIG.replayEnd -
+              CONFIG.replayStart +
+              1;
+
+            const quarterMs = totalMs / 4;
+            const out = {};
+
+            for (let i = 0; i < 4; i++) {
+              const start =
+                CONFIG.replayStart +
+                i * quarterMs;
+
+              const end =
+                i === 3
+                  ? CONFIG.replayEnd
+                  : CONFIG.replayStart +
+                    (i + 1) * quarterMs -
+                    1;
+
+              const rows = events.filter(
+                (x) =>
+                  x.timestampMs >= start &&
+                  x.timestampMs <= end
+              );
+
+              out[`Q${i + 1}`] = {
+                start: iso(start),
+                end: iso(end),
+                ...stats(rows),
+              };
+            }
+
+            return out;
+          }
+
+          function moduleSignals(ctx) {
+            const radar = analyzeV4Radar({
+              symbol: ctx.symbol,
+              nowTs: ctx.t,
+              snapshots: ctx.snapshots,
+              quoteVolume24h:
+                ctx.latest5.quoteVolume24h,
+              spreadPct: null,
+              compressionRatio:
+                ctx.hints.compressionRatio,
+              distanceToBreakoutPct:
+                ctx.hints.distanceToBreakoutPct,
+            });
+
+            const direction = analyzeV4Direction({
+              symbol: ctx.symbol,
+              radarDirection: "NEUTRAL",
+              candles4h: ctx.c4h,
+              candles12h: ctx.c12h,
+              candles1d: ctx.c1d,
+            });
+
+            const structure = analyzeV4Structure({
+              symbol: ctx.symbol,
+              direction: "NEUTRAL",
+              candles15m: ctx.c15,
+              candles1h: ctx.c1h,
+              candles4h: ctx.c4h,
+            });
+
+            return {
+              BELIT:
+                radar.eligible &&
+                ["LONG", "SHORT"].includes(
+                  radar.direction
+                ) &&
+                num(radar.score) >=
+                  V4_RADAR_CFG.strongScore
+                  ? {
+                      direction: radar.direction,
+                      score: num(radar.score),
+                      status: radar.status,
+                    }
+                  : null,
+
+              EMRE:
+                !direction.hardVeto &&
+                ["LONG", "SHORT"].includes(
+                  direction.direction
+                ) &&
+                num(direction.score) >=
+                  V4_DIRECTION_CFG
+                    .strongDirectionScore
+                  ? {
+                      direction:
+                        direction.direction,
+                      score: num(direction.score),
+                      status: direction.status,
+                    }
+                  : null,
+
+              AKSEL:
+                ["LONG", "SHORT"].includes(
+                  structure.direction
+                ) &&
+                num(structure.score) >=
+                  V4_STRUCTURE_CFG.strongScore
+                  ? {
+                      direction:
+                        structure.direction,
+                      score: num(structure.score),
+                      status: structure.status,
+                    }
+                  : null,
+            };
+          }
+
+          function teamAgreement(
+            teamName,
+            moduleMap
+          ) {
+            const members = TEAMS[teamName];
+
+            const signals = members.map(
+              (member) => moduleMap[member]
+            );
+
+            if (signals.some((x) => !x)) {
+              return null;
+            }
+
+            const directions = new Set(
+              signals.map((x) => x.direction)
+            );
+
+            if (directions.size !== 1) {
+              return null;
+            }
+
+            const direction =
+              signals[0].direction;
+
+            return {
+              direction,
+              memberSignals:
+                Object.fromEntries(
+                  members.map((member) => [
+                    member,
+                    moduleMap[member],
+                  ])
+                ),
+              averageScore:
+                average(
+                  signals.map((x) =>
+                    num(x.score)
+                  )
+                ),
+            };
+          }
+
+          async function replaySymbol(symbol) {
+            console.log(
+              `\n========== ${symbol} CHEMISTRY LAB ==========`
+            );
+
+            const raw =
+              await loadFrozenFiveMinuteRows(
+                symbol
+              );
+
+            const five = addVolumeState(raw);
+
+            const fifteen = aggregateCandles(
+              five,
+              15
+            );
+
+            const hourly = aggregateCandles(
+              five,
+              60
+            );
+
+            const four = aggregateCandles(
+              five,
+              240
+            );
+
+            const twelve = aggregateCandles(
+              five,
+              720
+            );
+
+            const daily = aggregateCandles(
+              five,
+              1440
+            );
+
+            const replayBars = fifteen.filter(
+              (x) =>
+                x.closeTime >=
+                  CONFIG.replayStart &&
+                x.closeTime <=
+                  CONFIG.replayEnd
+            );
+
+            const events = [];
+            const rawAgreement = Object.fromEntries(
+              Object.keys(TEAMS).map((team) => [
+                team,
+                0,
+              ])
+            );
+
+            const lastSignal = new Map();
+
+            const stepBars = Math.max(
+              1,
+              CONFIG.stepMinutes / 15
+            );
+
+            for (
+              let index = 0;
+              index < replayBars.length;
+              index++
+            ) {
+              if (index % stepBars !== 0) {
+                continue;
+              }
+
+              const t = replayBars[index].closeTime;
+
+              const c5 = sliceUntil(
+                five,
+                t,
+                320
+              );
+
+              const c15 = sliceUntil(
+                fifteen,
+                t,
+                140
+              );
+
+              const c1h = sliceUntil(
+                hourly,
+                t,
+                140
+              );
+
+              const c4h = sliceUntil(
+                four,
+                t,
+                140
+              );
+
+              const c12h = sliceUntil(
+                twelve,
+                t,
+                110
+              );
+
+              const c1d = sliceUntil(
+                daily,
+                t,
+                110
+              );
+
+              const latest5 = c5.at(-1);
+
+              if (!latest5) {
+                continue;
+              }
+
+              const hints =
+                radarStructureHints(c15);
+
+              const snapshots = c5.map(
+                (x) => ({
+                  ts: x.closeTime,
+                  price: x.close,
+                  quoteVolume24h:
+                    x.cumulativeQuote,
+                })
+              );
+
+              const ctx = {
+                symbol,
+                t,
+                latest5,
+                c15,
+                c1h,
+                c4h,
+                c12h,
+                c1d,
+                hints,
+                snapshots,
+              };
+
+              const modules =
+                moduleSignals(ctx);
+
+              for (
+                const teamName of
+                Object.keys(TEAMS)
+              ) {
+                const agreement =
+                  teamAgreement(
+                    teamName,
+                    modules
+                  );
+
+                if (!agreement) {
+                  continue;
+                }
+
+                rawAgreement[teamName]++;
+
+                const key =
+                  `${teamName}:${symbol}:${agreement.direction}`;
+
+                const previous =
+                  lastSignal.get(key);
+
+                if (
+                  previous &&
+                  t - previous <
+                    CONFIG.cooldownHours *
+                      HOUR
+                ) {
+                  continue;
+                }
+
+                const geometry =
+                  commonGeometry(
+                    agreement.direction,
+                    latest5.close,
+                    c15
+                  );
+
+                if (!geometry) {
+                  continue;
+                }
+
+                lastSignal.set(key, t);
+
+                const event = {
+                  version: VERSION,
+                  team: teamName,
+                  members: TEAMS[teamName],
+                  timestamp: iso(t),
+                  timestampMs: t,
+                  symbol,
+                  direction:
+                    agreement.direction,
+                  averageScore: round(
+                    agreement.averageScore,
+                    4
+                  ),
+                  memberSignals:
+                    agreement.memberSignals,
+                  entry: geometry.entry,
+                  stop: geometry.stop,
+                  tp1: geometry.tp1,
+                  stopDistancePct: round(
+                    geometry.stopDistancePct,
+                    4
+                  ),
+                };
+
+                Object.assign(
+                  event,
+                  evaluateOutcome(
+                    event,
+                    five
+                  )
+                );
+
+                events.push(event);
+              }
+            }
+
+            return {
+              symbol,
+              rawAgreement,
+              events,
+            };
+          }
+
+          async function main() {
+            const manifest =
+              await loadFrozenManifest();
+
+            if (
+              !Number.isFinite(
+                CONFIG.replayStart
+              ) ||
+              !Number.isFinite(
+                CONFIG.replayEnd
+              ) ||
+              CONFIG.replayEnd <=
+                CONFIG.replayStart
+            ) {
+              throw new Error(
+                "Invalid replay window"
+              );
+            }
+
+            const allEvents = [];
+            const rawAgreement = {};
+
+            for (
+              const symbol of
+              CONFIG.symbols
+            ) {
+              const result =
+                await replaySymbol(
+                  symbol
+                );
+
+              allEvents.push(
+                ...result.events
+              );
+
+              rawAgreement[symbol] =
+                result.rawAgreement;
+            }
+
+            allEvents.sort(
+              (a, b) => {
+                if (
+                  a.timestampMs !==
+                  b.timestampMs
+                ) {
+                  return (
+                    a.timestampMs -
+                    b.timestampMs
+                  );
+                }
+
+                return a.team.localeCompare(
+                  b.team
+                );
+              }
+            );
+
+            const teams = {};
+
+            for (
+              const teamName of
+              Object.keys(TEAMS)
+            ) {
+              const rows =
+                allEvents.filter(
+                  (x) =>
+                    x.team ===
+                    teamName
+                );
+
+              teams[teamName] = {
+                members:
+                  TEAMS[teamName],
+
+                overall:
+                  stats(rows),
+
+                quarters:
+                  quarterSummary(rows),
+
+                bySymbol:
+                  grouped(
+                    rows,
+                    (x) => x.symbol
+                  ),
+
+                byDirection:
+                  grouped(
+                    rows,
+                    (x) => x.direction
+                  ),
+              };
+            }
+
+            const ranking =
+              Object.entries(teams)
+                .map(([team, value]) => ({
+                  team,
+                  members: value.members,
+                  signals:
+                    value.overall.signals,
+                  winRatePct:
+                    value.overall.winRatePct,
+                  avgAccountPctAt1Risk:
+                    value.overall
+                      .avgAccountPctAt1Risk,
+                  cumulativeAccountPctPointsAt1Risk:
+                    value.overall
+                      .cumulativeAccountPctPointsAt1Risk,
+                  profitFactor:
+                    value.overall
+                      .profitFactor,
+                  maxDrawdownPctPointsAt1Risk:
+                    value.overall
+                      .maxDrawdownPctPointsAt1Risk,
+                }))
+                .sort(
+                  (a, b) =>
+                    (
+                      b.avgAccountPctAt1Risk ??
+                      -Infinity
+                    ) -
+                    (
+                      a.avgAccountPctAt1Risk ??
+                      -Infinity
+                    )
+                );
+
+            const soloKeys = [
+              "BELIT",
+              "EMRE",
+              "AKSEL",
+            ];
+
+            const chemistry = {};
+
+            for (
+              const teamName of
+              [
+                "BELIT_EMRE",
+                "BELIT_AKSEL",
+                "EMRE_AKSEL",
+                "BELIT_EMRE_AKSEL",
+              ]
+            ) {
+              const team = teams[teamName];
+              const members = TEAMS[teamName];
+
+              const memberStats =
+                members.map(
+                  (member) =>
+                    teams[member].overall
+                );
+
+              const bestSoloAvg =
+                Math.max(
+                  ...memberStats.map(
+                    (x) =>
+                      x.avgAccountPctAt1Risk ??
+                      -Infinity
+                  )
+                );
+
+              const bestSoloWin =
+                Math.max(
+                  ...memberStats.map(
+                    (x) =>
+                      x.winRatePct ??
+                      -Infinity
+                  )
+                );
+
+              const lowestSoloDD =
+                Math.min(
+                  ...memberStats
+                    .map(
+                      (x) =>
+                        x.maxDrawdownPctPointsAt1Risk
+                    )
+                    .filter(
+                      Number.isFinite
+                    )
+                );
+
+              chemistry[teamName] = {
+                members,
+
+                signals:
+                  team.overall.signals,
+
+                signalRetentionVsSmallestSoloPct:
+                  round(
+                    (
+                      team.overall.signals /
+                      Math.min(
+                        ...memberStats.map(
+                          (x) => x.signals
+                        )
+                      )
+                    ) * 100,
+                    2
+                  ),
+
+                avgEdgeDeltaVsBestSoloPctPoints:
+                  round(
+                    team.overall
+                      .avgAccountPctAt1Risk -
+                      bestSoloAvg,
+                    4
+                  ),
+
+                winRateDeltaVsBestSoloPctPoints:
+                  round(
+                    team.overall
+                      .winRatePct -
+                      bestSoloWin,
+                    2
+                  ),
+
+                drawdownDeltaVsLowestSoloPctPoints:
+                  round(
+                    team.overall
+                      .maxDrawdownPctPointsAt1Risk -
+                      lowestSoloDD,
+                    4
+                  ),
+
+                positiveQuarterCount:
+                  Object.values(
+                    team.quarters
+                  ).filter(
+                    (q) =>
+                      num(
+                        q.cumulativeAccountPctPointsAt1Risk
+                      ) > 0
+                  ).length,
+              };
+            }
+
+            const output = {
+              version: VERSION,
+              mode: "HISTORICAL_REPLAY_ONLY",
+
+              purpose:
+                "Measure whether pre-existing strong BELIT, EMRE and AKSEL rules improve when they agree on direction at the same timestamp.",
+
+              dataset: {
+                datasetId:
+                  manifest.datasetId,
+                rootContentSha256:
+                  manifest.rootContentSha256,
+              },
+
+              replayWindow: {
+                start:
+                  iso(
+                    CONFIG.replayStart
+                  ),
+                end:
+                  iso(
+                    CONFIG.replayEnd
+                  ),
+                days:
+                  round(
+                    (
+                      CONFIG.replayEnd -
+                      CONFIG.replayStart +
+                      1
+                    ) /
+                      DAY,
+                    2
+                  ),
+                stepMinutes:
+                  CONFIG.stepMinutes,
+                cooldownHours:
+                  CONFIG.cooldownHours,
+                outcomeHours:
+                  CONFIG.outcomeHours,
+              },
+
+              thresholds: {
+                BELIT:
+                  V4_RADAR_CFG
+                    .strongScore,
+                EMRE:
+                  V4_DIRECTION_CFG
+                    .strongDirectionScore,
+                AKSEL:
+                  V4_STRUCTURE_CFG
+                    .strongScore,
+                note:
+                  "All thresholds are pre-existing 7.0 strong levels. No threshold is optimized from chemistry results.",
+              },
+
+              teamRule:
+                "Every member must independently qualify as STRONG at the same timestamp and all must point in the same LONG/SHORT direction.",
+
+              commonExecutionWrapper: {
+                entry:
+                  "current 5m close",
+                stop:
+                  `${CONFIG.stopAtr} x 15m ATR`,
+                target:
+                  `${CONFIG.targetMultiple} x stop distance`,
+                sameCandleStopAndTarget:
+                  "STOP_FIRST_CONSERVATIVE",
+                intuitiveAccountTranslation:
+                  "At hypothetical fixed 1% account risk per trade, one normalized result unit maps to one percentage point before fees/slippage/overlap. This is not compounded account return.",
+              },
+
+              integrity: {
+                frozenDataset: true,
+                futureDataUsedForSignals: false,
+                outcomeDataSeparatedAfterSignal: true,
+                commonExecutionForAllTeams: true,
+                sameTimestampAgreementRequired: true,
+                productionStrategyFilesModified: false,
+                scannerEnabled: false,
+                paperOrdersEnabled: false,
+                realOrdersEnabled: false,
+              },
+
+              ranking,
+              chemistry,
+              teams,
+              rawAgreement,
+
+              caveats: [
+                "BELIT partly uses historical volume proxy; prior cross-exchange validation accepted price/structure but DOGE normalized-volume proxy remained below the chosen threshold.",
+                "This compares coded rule modules, not the real humans' published-trade performance.",
+                "Fees, slippage, funding, simultaneous-position overlap, leverage, compounding and cross-coin correlation are not modeled.",
+                "All results use the same frozen historical 100-day research window; they are not forward PAPER evidence.",
+                "No PAPER or LIVE permission is granted by this test."
+              ],
+            };
+
+            await mkdir(
+              "artifacts_chemistry",
+              {
+                recursive: true,
+              }
+            );
+
+            await writeFile(
+              "artifacts_chemistry/v4_chemistry_summary.json",
+              JSON.stringify(
+                output,
+                null,
+                2
+              ),
+              "utf8"
+            );
+
+            await writeFile(
+              "artifacts_chemistry/v4_chemistry_events.json",
+              JSON.stringify(
+                allEvents,
+                null,
+                2
+              ),
+              "utf8"
+            );
+
+            console.log(
+              "===== V4 CHEMISTRY REPLAY ====="
+            );
+
+            console.log(
+              JSON.stringify(
+                {
+                  integrity:
+                    output.integrity,
+                  thresholds:
+                    output.thresholds,
+                  ranking:
+                    output.ranking,
+                  chemistry:
+                    output.chemistry,
+                },
+                null,
+                2
+              )
+            );
+          }
+
+          main().catch((error) => {
+            console.error(
+              "V4 CHEMISTRY REPLAY FAILED"
+            );
+            console.error(
+              error?.stack || error
+            );
+            process.exitCode = 1;
+          });
+          NODE
+
+          node --check v4_chemistry_replay.mjs
+
+      - name: Run Chemistry Replay
+        run: node v4_chemistry_replay.mjs
+
+      - name: Show Scoreboard
+        if: always()
+        shell: bash
+        run: |
+          if [ -f artifacts_chemistry/v4_chemistry_summary.json ]; then
+            node --input-type=module <<'NODE'
+            import { readFile } from "node:fs/promises";
+
+            const x = JSON.parse(
+              await readFile(
+                "artifacts_chemistry/v4_chemistry_summary.json",
+                "utf8"
+              )
+            );
+
+            console.log(
+              JSON.stringify(
+                {
+                  integrity: x.integrity,
+                  thresholds: x.thresholds,
+                  ranking: x.ranking,
+                  chemistry: x.chemistry,
+                  teams: x.teams,
+                },
+                null,
+                2
+              )
+            );
+            NODE
+          else
+            echo "Chemistry summary was not generated."
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-chemistry-results
+          path: |
+            artifacts_chemistry/v4_chemistry_summary.json
+            artifacts_chemistry/v4_chemistry_events.json
+          if-no-files-found: warn
+          retention-days: 30
