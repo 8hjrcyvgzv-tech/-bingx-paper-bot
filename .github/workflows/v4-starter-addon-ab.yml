@@ -1,0 +1,448 @@
+name: V4 Starter Add-On A-B Replay
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - ".github/workflows/v4-starter-addon-ab.yml"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      V4_FROZEN_DATASET_ID: V4_CORE6_BINANCE_UM_5M_20260215_20260903_EBECBEDEEE03
+      V4_FROZEN_ROOT_SHA256: ebecbedeee03954dc9a8ff5fdabf764ebf92fb8cd90b30a659f8cbeaf9d67965
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download Frozen Dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: v4-frozen-core6-200d-dataset
+          path: frozen_dataset
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33924848219
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f v4_frozen_replay_harness.mjs
+          test -f v4_frozen_data_provider.mjs
+          test -f v4_replay_runner.mjs
+          test -f v4_logic_test.mjs
+          node --check v4_frozen_replay_harness.mjs
+          node --check v4_frozen_data_provider.mjs
+          node --check v4_replay_runner.mjs
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' \
+            v4_frozen_replay_harness.mjs \
+            v4_frozen_data_provider.mjs \
+            v4_replay_runner.mjs
+          echo "READ-ONLY HISTORICAL REPLAY PASS"
+
+      - name: Logic Test
+        run: node v4_logic_test.mjs
+
+      - name: Control 100D — 6H Cooldown
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts artifacts_control artifacts_stream artifacts_addon
+          REPLAY_SIGNAL_COOLDOWN_HOURS=6 node v4_frozen_replay_harness.mjs
+          test -f artifacts/v4_replay_signals.json
+          test -f artifacts/v4_replay_summary.json
+          mv artifacts artifacts_control
+
+      - name: Candidate Stream 100D — No Cooldown
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPLAY_SIGNAL_COOLDOWN_HOURS=0 node v4_frozen_replay_harness.mjs
+          test -f artifacts/v4_replay_signals.json
+          mv artifacts artifacts_stream
+
+      - name: Staged Entry A-B
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts_addon
+
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+          import { loadFrozenFiveMinuteRows } from "./v4_frozen_data_provider.mjs";
+
+          const control = JSON.parse(
+            await readFile("artifacts_control/v4_replay_signals.json", "utf8")
+          );
+
+          const summary = JSON.parse(
+            await readFile("artifacts_control/v4_replay_summary.json", "utf8")
+          );
+
+          const stream = JSON.parse(
+            await readFile("artifacts_stream/v4_replay_signals.json", "utf8")
+          );
+
+          const num = (v) => {
+            const x = Number(v);
+            return Number.isFinite(x) ? x : null;
+          };
+
+          const round = (v, d = 4) => {
+            if (!Number.isFinite(v)) return null;
+            const m = 10 ** d;
+            return Math.round(v * m) / m;
+          };
+
+          if (!Array.isArray(control) || control.length !== 892) {
+            throw new Error(`Expected 892 control setups, got ${control?.length}`);
+          }
+
+          if (!Array.isArray(stream) || !stream.length) {
+            throw new Error("No-cooldown candidate stream is empty");
+          }
+
+          const bySide = new Map();
+
+          for (const e of stream) {
+            const key = `${e.symbol}|${e.direction}`;
+            if (!bySide.has(key)) bySide.set(key, []);
+            bySide.get(key).push(e);
+          }
+
+          for (const rows of bySide.values()) {
+            rows.sort((a, b) => num(a.timestampMs) - num(b.timestampMs));
+          }
+
+          const candleCache = new Map();
+
+          for (const symbol of [...new Set(control.map((x) => x.symbol))]) {
+            candleCache.set(symbol, await loadFrozenFiveMinuteRows(symbol));
+          }
+
+          function initialTradeStillAlive(starter, confirmTs) {
+            const startTs = num(starter.timestampMs);
+            const stop = num(starter.stop);
+            const tp1 = num(starter.tp1);
+            const rows = candleCache.get(starter.symbol) || [];
+
+            if (!Number.isFinite(startTs) || !(stop > 0) || !(tp1 > 0)) {
+              return false;
+            }
+
+            for (const bar of rows) {
+              if (bar.closeTime <= startTs) continue;
+              if (bar.closeTime > confirmTs) break;
+
+              const stopHit =
+                starter.direction === "LONG"
+                  ? bar.low <= stop
+                  : bar.high >= stop;
+
+              const tpHit =
+                starter.direction === "LONG"
+                  ? bar.high >= tp1
+                  : bar.low <= tp1;
+
+              if (stopHit || tpHit) return false;
+            }
+
+            return true;
+          }
+
+          function progressPct(starter, candidate) {
+            const a = num(starter.entry);
+            const b = num(candidate.entry);
+
+            if (!(a > 0) || !(b > 0)) return null;
+
+            const raw = ((b - a) / a) * 100;
+
+            return starter.direction === "LONG"
+              ? raw
+              : -raw;
+          }
+
+          function findConfirm(starter) {
+            const startTs = num(starter.timestampMs);
+            const endTs = startTs + 6 * 60 * 60 * 1000;
+            const rows = bySide.get(`${starter.symbol}|${starter.direction}`) || [];
+
+            for (const e of rows) {
+              const ts = num(e.timestampMs);
+
+              if (!Number.isFinite(ts) || ts <= startTs) continue;
+              if (ts > endTs) break;
+
+              const status = String(e.structureStatus || "").toUpperCase();
+              const score = num(e.finalScore);
+              const rr1 = num(e.rr1);
+              const resultR = num(e.resultR);
+              const progress = progressPct(starter, e);
+
+              if (!["BREAKOUT", "RETEST"].includes(status)) continue;
+              if (!(score >= 7.75)) continue;
+              if (!(rr1 >= 1.50)) continue;
+              if (e.hardVeto === true) continue;
+              if (!Number.isFinite(resultR)) continue;
+              if (!Number.isFinite(progress) || progress < 0) continue;
+              if (!initialTradeStillAlive(starter, ts)) continue;
+
+              return {
+                timestamp: e.timestamp,
+                timestampMs: ts,
+                delayMinutes: round((ts - startTs) / 60000, 2),
+                structureStatus: status,
+                finalScore: score,
+                rr1,
+                rr2: num(e.rr2),
+                progressFromStarterPct: round(progress, 4),
+                resultR,
+                outcome: e.outcome,
+              };
+            }
+
+            return null;
+          }
+
+          function maxDD(values) {
+            let eq = 0;
+            let peak = 0;
+            let dd = 0;
+
+            for (const v of values) {
+              eq += v;
+              peak = Math.max(peak, eq);
+              dd = Math.max(dd, peak - eq);
+            }
+
+            return dd;
+          }
+
+          function stats(rows, field) {
+            const values = rows.map((x) => x[field]).filter(Number.isFinite);
+            const wins = values.filter((x) => x > 0).length;
+            const losses = values.filter((x) => x < 0).length;
+            const total = values.reduce((a, b) => a + b, 0);
+
+            return {
+              setups: values.length,
+              wins,
+              losses,
+              winRatePct: values.length
+                ? round((wins / values.length) * 100, 2)
+                : null,
+              avgAccountPctPerSetup: values.length
+                ? round(total / values.length, 4)
+                : null,
+              cumulativePctPoints: round(total, 4),
+              maxDrawdownPctPoints: round(maxDD(values), 4),
+              equivalent1000Usd: {
+                avgPerSetupUsd: values.length
+                  ? round((total / values.length) * 10, 2)
+                  : null,
+                cumulativeScoreUsd: round(total * 10, 2),
+                maxDrawdownScoreUsd: round(maxDD(values) * 10, 2),
+              },
+            };
+          }
+
+          const events = control
+            .map((starter) => {
+              const starterR = num(starter.resultR);
+              if (!Number.isFinite(starterR)) return null;
+
+              const confirm = findConfirm(starter);
+
+              // A = full 1.00% account risk immediately.
+              const fullUpfrontPct = starterR * 1.00;
+
+              // B = 0.50% early, plus 0.50% only after real later confirmation.
+              const stagedPct =
+                starterR * 0.50 +
+                (confirm ? confirm.resultR * 0.50 : 0);
+
+              return {
+                timestamp: starter.timestamp,
+                timestampMs: num(starter.timestampMs),
+                symbol: starter.symbol,
+                direction: starter.direction,
+                starterScore: num(starter.finalScore),
+                starterStructure: starter.structureStatus,
+                starterResultR: starterR,
+                fullUpfrontPct: round(fullUpfrontPct, 4),
+                stagedPct: round(stagedPct, 4),
+                deltaPct: round(stagedPct - fullUpfrontPct, 4),
+                confirmed: Boolean(confirm),
+                confirmation: confirm,
+              };
+            })
+            .filter(Boolean)
+            .sort((a, b) => a.timestampMs - b.timestampMs);
+
+          const confirmed = events.filter((x) => x.confirmed);
+          const noConfirm = events.filter((x) => !x.confirmed);
+
+          const baseline = stats(events, "fullUpfrontPct");
+          const staged = stats(events, "stagedPct");
+          const confirmedStaged = stats(confirmed, "stagedPct");
+          const noConfirmStaged = stats(noConfirm, "stagedPct");
+
+          const bySymbol = {};
+
+          for (const symbol of [...new Set(events.map((x) => x.symbol))]) {
+            bySymbol[symbol] = stats(
+              events.filter((x) => x.symbol === symbol),
+              "stagedPct"
+            );
+          }
+
+          const byDirection = {};
+
+          for (const direction of ["LONG", "SHORT"]) {
+            byDirection[direction] = stats(
+              events.filter((x) => x.direction === direction),
+              "stagedPct"
+            );
+          }
+
+          const output = {
+            version: "V4_STARTER_ADDON_AB_1",
+            mode: "HISTORICAL_REPLAY_ONLY",
+            dataset: summary.dataset ?? null,
+            replayWindow: summary.replayWindow ?? null,
+            integrity: {
+              controlSetups: control.length,
+              noCooldownCandidateSnapshots: stream.length,
+              productionFilesModified: false,
+              scannerEnabled: false,
+              paperOrdersEnabled: false,
+              realOrdersEnabled: false,
+            },
+            test: {
+              baseline:
+                "Risk 1.00% of account immediately at every STARTER.",
+              staged:
+                "Risk 0.50% at STARTER; within 6h add another 0.50% only if a later same-direction snapshot is BREAKOUT/RETEST, score >= 7.75, remaining RR1 >= 1.50, has no hard veto, entry is not worse than starter, and original trade has not already touched stop or TP1.",
+            },
+            confirmationCount: confirmed.length,
+            confirmationRatePct: round((confirmed.length / events.length) * 100, 2),
+            baseline,
+            staged,
+            delta: {
+              cumulativePctPoints: round(
+                staged.cumulativePctPoints - baseline.cumulativePctPoints,
+                4
+              ),
+              avgPerSetupPct: round(
+                staged.avgAccountPctPerSetup - baseline.avgAccountPctPerSetup,
+                4
+              ),
+              maxDrawdownPctPoints: round(
+                staged.maxDrawdownPctPoints - baseline.maxDrawdownPctPoints,
+                4
+              ),
+              equivalent1000UsdCumulativeScore: round(
+                (staged.cumulativePctPoints - baseline.cumulativePctPoints) * 10,
+                2
+              ),
+            },
+            confirmedSubset: {
+              count: confirmed.length,
+              staged: confirmedStaged,
+            },
+            noConfirmationSubset: {
+              count: noConfirm.length,
+              staged: noConfirmStaged,
+            },
+            bySymbol,
+            byDirection,
+            guardrails: [
+              "Percent values are risk-normalized percentage-point scores, not compounded account balance.",
+              "The $1,000 translation uses 1 percentage point = $10 only for intuitive comparison.",
+              "Fees, slippage, funding, simultaneous-position overlap and cross-coin correlation are not modeled.",
+              "Confirmation must occur later than the starter and before the original stop or TP1 is touched.",
+              "The add-on leg uses the later candidate's own entry/stop/target geometry and replay result.",
+              "Binance official archive is a validated historical price/structure proxy; BingX-native volume is not fully reproduced and DOGE volume proxy remains a caveat.",
+              "No PAPER or LIVE permission is granted by this test."
+            ],
+          };
+
+          await writeFile(
+            "artifacts_addon/v4_starter_addon_ab_summary.json",
+            JSON.stringify(output, null, 2),
+            "utf8"
+          );
+
+          await writeFile(
+            "artifacts_addon/v4_starter_addon_ab_events.json",
+            JSON.stringify(events, null, 2),
+            "utf8"
+          );
+
+          console.log("===== V4 STARTER ADD-ON A/B =====");
+          console.log(
+            JSON.stringify(
+              {
+                integrity: output.integrity,
+                confirmationCount: output.confirmationCount,
+                confirmationRatePct: output.confirmationRatePct,
+                baseline: output.baseline,
+                staged: output.staged,
+                delta: output.delta,
+                confirmedSubset: output.confirmedSubset,
+                noConfirmationSubset: output.noConfirmationSubset,
+                bySymbol: output.bySymbol,
+                byDirection: output.byDirection,
+              },
+              null,
+              2
+            )
+          );
+          NODE
+
+      - name: Show Result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f artifacts_addon/v4_starter_addon_ab_summary.json ]; then
+            cat artifacts_addon/v4_starter_addon_ab_summary.json
+          else
+            echo "Starter add-on A/B summary was not generated."
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-starter-addon-ab-results
+          path: |
+            artifacts_addon/v4_starter_addon_ab_summary.json
+            artifacts_addon/v4_starter_addon_ab_events.json
+            artifacts_control/v4_replay_summary.json
+            artifacts_control/v4_replay_signals.json
+            artifacts_stream/v4_replay_summary.json
+            artifacts_stream/v4_replay_signals.json
+          if-no-files-found: warn
+          retention-days: 30
