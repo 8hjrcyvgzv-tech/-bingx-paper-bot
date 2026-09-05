@@ -1,0 +1,161 @@
+name: V4 Structure Exit OOS Costs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - "v4_structure_exit_oos_costs.mjs"
+      - ".github/workflows/v4-structure-exit-oos-costs.yml"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+      # Locked independent block: dataset ends one day before the original
+      # development dataset began (original start = 2026-02-15).
+      OOS_FIXED_END_DAY: "2026-02-14"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f v4_build_frozen_dataset.py
+          test -f v4_frozen_replay_harness.mjs
+          test -f v4_frozen_data_provider.mjs
+          test -f v4_structure_exit_runner.mjs
+          test -f v4_structure_exit_oos_costs.mjs
+
+          python -m py_compile v4_build_frozen_dataset.py
+          node --check v4_frozen_replay_harness.mjs
+          node --check v4_frozen_data_provider.mjs
+          node --check v4_structure_exit_runner.mjs
+          node --check v4_structure_exit_oos_costs.mjs
+
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' \
+            v4_structure_exit_oos_costs.mjs \
+            v4_structure_exit_runner.mjs \
+            v4_frozen_replay_harness.mjs \
+            v4_frozen_data_provider.mjs
+
+          echo "V4 OOS COSTS: READ-ONLY SAFETY PASS"
+
+      - name: Build Independent Frozen OOS Dataset
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf frozen_dataset .v4_oos_builder.py
+          cp v4_build_frozen_dataset.py .v4_oos_builder.py
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.v4_oos_builder.py')
+          s = p.read_text(encoding='utf-8')
+          old = '    latest_day = latest_complete_archive_day()'
+          new = '''    fixed_end = os.getenv("OOS_FIXED_END_DAY")\n    if not fixed_end:\n        raise RuntimeError("OOS_FIXED_END_DAY is required")\n    latest_day = datetime.strptime(fixed_end, "%Y-%m-%d").replace(tzinfo=timezone.utc)\n    print(f"[OOS-LOCK] fixed dataset end: {latest_day.date()}")'''
+          if s.count(old) != 1:
+              raise SystemExit('Could not uniquely patch fixed OOS end date')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+
+          V4_WARMUP_DAYS=100 \
+          V4_REPLAY_DAYS=100 \
+          V4_OUTCOME_TAIL_DAYS=1 \
+          V4_DATASET_SYMBOLS="$REPLAY_SYMBOLS" \
+          python .v4_oos_builder.py
+
+          rm -f .v4_oos_builder.py
+          test -f frozen_dataset/manifest.json
+          test -f frozen_dataset/build_summary.json
+
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          m = json.loads(Path('frozen_dataset/manifest.json').read_text())
+          if m.get('status') != 'FROZEN_EXACT_PASS':
+              raise SystemExit(f"OOS dataset build failed: {m.get('status')}")
+          layout = m['layout']
+          if layout['datasetEnd'][:10] != os.environ['OOS_FIXED_END_DAY']:
+              raise SystemExit(f"Unexpected OOS dataset end: {layout['datasetEnd']}")
+          if layout['replayEnd'][:10] != '2026-02-13':
+              raise SystemExit(f"Unexpected OOS replay end: {layout['replayEnd']}")
+          env_path = Path(os.environ['GITHUB_ENV'])
+          with env_path.open('a', encoding='utf-8') as f:
+              f.write(f"V4_FROZEN_DATASET_ID={m['datasetId']}\n")
+              f.write(f"V4_FROZEN_ROOT_SHA256={m['rootContentSha256']}\n")
+          print(json.dumps({
+              'datasetId': m['datasetId'],
+              'rootContentSha256': m['rootContentSha256'],
+              'layout': layout,
+          }, indent=2))
+          PY
+
+      - name: Run Independent Frozen OOS Control
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts
+          node v4_frozen_replay_harness.mjs
+          test -f artifacts/v4_replay_signals.json
+          test -f artifacts/v4_replay_summary.json
+
+      - name: Run Locked Structure Exit A With Costs
+        shell: bash
+        run: |
+          set -euo pipefail
+          node v4_structure_exit_oos_costs.mjs
+          test -f artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json
+          test -f artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+
+      - name: Show Result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json ]; then
+            cat artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json
+          else
+            echo "OOS costs summary was not generated."
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-structure-exit-oos-costs-results
+          path: |
+            frozen_dataset/manifest.json
+            frozen_dataset/build_summary.json
+            frozen_dataset/data/*.csv.gz
+            artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json
+            artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+            artifacts/v4_replay_summary.json
+            artifacts/v4_replay_signals.json
+          if-no-files-found: warn
+          retention-days: 30
