@@ -1,0 +1,256 @@
+name: V4 Doruk Flow OOS Confirmation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - ".github/workflows/v4-doruk-flow-oos.yml"
+
+jobs:
+  oos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      V4_FROZEN_DATASET_ID: V4_CORE6_BINANCE_UM_5M_20260215_20260903_EBECBEDEEE03
+      V4_FROZEN_ROOT_SHA256: ebecbedeee03954dc9a8ff5fdabf764ebf92fb8cd90b30a659f8cbeaf9d67965
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_START: "2026-04-01T00:00:00.000Z"
+      REPLAY_END: "2026-05-24T23:59:59.999Z"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+      FLOW_ARCHIVE_WORKERS: "12"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download Frozen Dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: v4-frozen-core6-200d-dataset
+          path: frozen_dataset
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33924848219
+
+      - name: OOS Safety Lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .github/workflows/v4-doruk-flow-chemistry.yml
+          test -f v4_direction.js
+          test -f v4_flow.js
+          test -f frozen_dataset/manifest.json
+
+          grep -q 'minCandles1d: 45' v4_direction.js
+          grep -q 'supportiveScore: 5.75' v4_flow.js
+          grep -q 'pressureStrongScore: 7.0' v4_flow.js
+          grep -q 'againstScore: 4.25' v4_flow.js
+
+          echo "OOS LOCK PASS: thresholds unchanged; training window excluded."
+
+      - name: Extract Locked Chemistry Scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          src = Path('.github/workflows/v4-doruk-flow-chemistry.yml').read_text(encoding='utf-8')
+          lines = src.splitlines()
+
+          def extract(begin, end):
+              out = []
+              capture = False
+              for line in lines:
+                  if line.strip() == begin:
+                      capture = True
+                      continue
+                  if capture and line.strip() == end:
+                      return '\n'.join(out) + '\n'
+                  if capture:
+                      prefix = '          '
+                      out.append(line[len(prefix):] if line.startswith(prefix) else line.lstrip())
+              raise RuntimeError(f'block not found: {begin}')
+
+          def must_replace(text, old, new):
+              if old not in text:
+                  raise RuntimeError(f'locked source fragment missing: {old}')
+              return text.replace(old, new, 1)
+
+          py = extract("cat > v4_flow_proxy_builder.py <<'PY'", 'PY')
+          js = extract("cat > v4_doruk_flow_chemistry_replay.mjs <<'NODE'", 'NODE')
+
+          py = must_replace(
+              py,
+              'DATA_START = datetime(2026, 5, 25, tzinfo=timezone.utc)',
+              'DATA_START = datetime(2026, 3, 31, tzinfo=timezone.utc)'
+          )
+          py = must_replace(
+              py,
+              'DATA_END = datetime(2026, 9, 2, tzinfo=timezone.utc)',
+              'DATA_END = datetime(2026, 5, 24, tzinfo=timezone.utc)'
+          )
+
+          js = must_replace(js, 'BELIT_EMRE: 1020,', 'BELIT_EMRE: null,')
+          js = must_replace(js, 'BELIT_AKSEL: 123,', 'BELIT_AKSEL: null,')
+          js = must_replace(
+              js,
+              'if (actual !== expected) {',
+              'if (expected !== null && actual !== expected) {'
+          )
+          js = must_replace(
+              js,
+              'BELIT_EMRE: CONFIG.expectedBaseline.BELIT_EMRE,',
+              'BELIT_EMRE: allEvents.filter((x) => x.team === "BELIT_EMRE").length,'
+          )
+          js = must_replace(
+              js,
+              'BELIT_AKSEL: CONFIG.expectedBaseline.BELIT_AKSEL,',
+              'BELIT_AKSEL: allEvents.filter((x) => x.team === "BELIT_AKSEL").length,'
+          )
+          js = must_replace(
+              js,
+              'exactPopulationAsserted: true,',
+              'exactPopulationAsserted: false,\n      oosPopulationMeasuredWithoutFlowSelection: true,'
+          )
+
+          Path('v4_flow_proxy_builder.py').write_text(py, encoding='utf-8')
+          Path('v4_doruk_flow_chemistry_replay.mjs').write_text(js, encoding='utf-8')
+          PY
+
+          python -m py_compile v4_flow_proxy_builder.py
+          node --check v4_doruk_flow_chemistry_replay.mjs
+
+      - name: Build OOS Flow Proxy
+        shell: bash
+        run: python v4_flow_proxy_builder.py
+
+      - name: Run Locked OOS Replay
+        shell: bash
+        run: node v4_doruk_flow_chemistry_replay.mjs
+
+      - name: Evaluate Predeclared Doruk Candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path('artifacts_flow_chemistry/v4_doruk_flow_chemistry_summary.json')
+          x = json.loads(p.read_text())
+
+          candidates = [
+              ('BELIT_AKSEL', 'FLOW_SUPPORTIVE', 75.0),
+              ('BELIT_EMRE', 'FLOW_SUPPORTIVE', 75.0),
+              ('BELIT_EMRE', 'PRESSURE_STRONG', 40.0),
+          ]
+
+          rows = []
+          for team, variant, min_retention in candidates:
+              base = x['teams'][team]['baseline']['overall']
+              v = x['teams'][team]['variants'][variant]
+              o = v['overall']
+              vs = v['vsBaseline']
+
+              expectancy_improves = (vs['avgComparisonDeltaPctPoints'] or 0) > 0
+              pf_not_worse = (o['profitFactor'] or 0) >= (base['profitFactor'] or 0)
+              dd_not_worse = (o['maxDrawdownComparisonPctPointsAt1Risk'] or 0) <= (base['maxDrawdownComparisonPctPointsAt1Risk'] or 0)
+              retention_ok = (vs['retentionPct'] or 0) >= min_retention
+              quarter_floor = max(3, x['teams'][team]['variants']['BASELINE']['positiveQuarterCount'])
+              quarters_ok = v['positiveQuarterCount'] >= quarter_floor
+
+              passed = all([
+                  expectancy_improves,
+                  pf_not_worse,
+                  dd_not_worse,
+                  retention_ok,
+                  quarters_ok,
+              ])
+
+              rows.append({
+                  'team': team,
+                  'variant': variant,
+                  'minRetentionPct': min_retention,
+                  'baselineSignals': base['signals'],
+                  'signals': o['signals'],
+                  'retentionPct': vs['retentionPct'],
+                  'baselineExpectancyR': base['avgComparisonPctPointsAt1Risk'],
+                  'expectancyR': o['avgComparisonPctPointsAt1Risk'],
+                  'expectancyDeltaR': vs['avgComparisonDeltaPctPoints'],
+                  'baselineProfitFactor': base['profitFactor'],
+                  'profitFactor': o['profitFactor'],
+                  'baselineMaxDrawdownR': base['maxDrawdownComparisonPctPointsAt1Risk'],
+                  'maxDrawdownR': o['maxDrawdownComparisonPctPointsAt1Risk'],
+                  'positiveQuarterCount': v['positiveQuarterCount'],
+                  'checks': {
+                      'expectancyImproves': expectancy_improves,
+                      'profitFactorNotWorse': pf_not_worse,
+                      'drawdownNotWorse': dd_not_worse,
+                      'retentionOk': retention_ok,
+                      'quartersOk': quarters_ok,
+                  },
+                  'oosPass': passed,
+              })
+
+          decision = {
+              'version': 'V4_DORUK_FLOW_OOS_CONFIRMATION_1',
+              'window': {
+                  'start': '2026-04-01T00:00:00.000Z',
+                  'end': '2026-05-24T23:59:59.999Z',
+                  'note': 'Ends one full outcome horizon before 2026-05-26 training start to prevent evaluation overlap.'
+              },
+              'lockedThresholds': {
+                  'FLOW_SUPPORTIVE': 5.75,
+                  'PRESSURE_STRONG': 7.0,
+              },
+              'candidates': rows,
+              'allCandidatesPass': all(r['oosPass'] for r in rows),
+              'productionPromotionGranted': False,
+              'paperLiveOrdersEnabled': False,
+          }
+
+          Path('artifacts_flow_chemistry/v4_doruk_flow_oos_decision.json').write_text(
+              json.dumps(decision, indent=2), encoding='utf-8'
+          )
+          print(json.dumps(decision, indent=2))
+          PY
+
+      - name: Show OOS Decision
+        shell: bash
+        run: |
+          cat artifacts_flow_chemistry/v4_doruk_flow_oos_decision.json
+          echo '### Doruk FLOW OOS' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat artifacts_flow_chemistry/v4_doruk_flow_oos_decision.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload OOS Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-doruk-flow-oos-results
+          path: |
+            artifacts_flow_chemistry/v4_doruk_flow_chemistry_summary.json
+            artifacts_flow_chemistry/v4_doruk_flow_chemistry_events.json
+            artifacts_flow_chemistry/v4_doruk_flow_oos_decision.json
+            flow_proxy_data/manifest.json
+          retention-days: 30
