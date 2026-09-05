@@ -1,11 +1,9 @@
 {
-  "name": "bingx-paper-bot",
-  "main": "worker_top100_v320_early_volume_radar.js",
-  "compatibility_date": "2026-08-28",
-  "keep_vars": true,
-  "triggers": {
-    "crons": ["* * * * *"]
-  },
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "bingx-v6-paper",
+  "main": "V6_Explosive_Move_Engine.js",
+  "compatibility_date": "2026-09-06",
+  "workers_dev": true,
   "durable_objects": {
     "bindings": [
       {
@@ -14,12 +12,20 @@
       }
     ]
   },
-  "observability": {
-    "enabled": true,
-    "logs": {
-      "enabled": true,
-      "invocation_logs": true,
-      "persist": true
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "PaperTracker"
+      ]
     }
+  ],
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  },
+  "observability": {
+    "enabled": true
   }
 }
