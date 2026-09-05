@@ -2,6 +2,11 @@ name: V4 Structure Exit Runner Replay
 
 on:
   workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - "v4_structure_exit_runner.mjs"
+      - ".github/workflows/v4-structure-exit-runner-replay.yml"
 
 jobs:
   replay:
