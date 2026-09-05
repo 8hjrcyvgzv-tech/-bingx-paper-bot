@@ -1,0 +1,111 @@
+name: V4 Structure Exit Full Replay
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - "v4_structure_exit_full_replay.mjs"
+      - ".github/workflows/v4-structure-exit-full-replay.yml"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      V4_FROZEN_DATASET_ID: V4_CORE6_BINANCE_UM_5M_20260215_20260903_EBECBEDEEE03
+      V4_FROZEN_ROOT_SHA256: ebecbedeee03954dc9a8ff5fdabf764ebf92fb8cd90b30a659f8cbeaf9d67965
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download Frozen Dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: v4-frozen-core6-200d-dataset
+          path: frozen_dataset
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33924848219
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f v4_structure_exit_runner.mjs
+          test -f v4_structure_exit_full_replay.mjs
+          test -f v4_frozen_replay_harness.mjs
+          test -f v4_frozen_data_provider.mjs
+
+          node --check v4_structure_exit_runner.mjs
+          node --check v4_structure_exit_full_replay.mjs
+          node --check v4_frozen_replay_harness.mjs
+          node --check v4_frozen_data_provider.mjs
+
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' \
+            v4_structure_exit_runner.mjs \
+            v4_structure_exit_full_replay.mjs \
+            v4_frozen_replay_harness.mjs \
+            v4_frozen_data_provider.mjs
+
+          echo "V4 STRUCTURE EXIT FULL REPLAY: READ-ONLY PASS"
+
+      - name: Run Frozen 100D Control
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts
+          node v4_frozen_replay_harness.mjs
+
+          test -f artifacts/v4_replay_signals.json
+          test -f artifacts/v4_replay_summary.json
+
+      - name: Run Full Structure Exit Replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          node v4_structure_exit_full_replay.mjs
+
+          test -f artifacts/runner_lab/v4_structure_exit_full_replay_summary.json
+          test -f artifacts/runner_lab/v4_structure_exit_full_replay_events.json
+
+      - name: Show Result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f artifacts/runner_lab/v4_structure_exit_full_replay_summary.json ]; then
+            cat artifacts/runner_lab/v4_structure_exit_full_replay_summary.json
+          else
+            echo "Full structure exit replay summary was not generated."
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-structure-exit-full-replay-results
+          path: |
+            artifacts/runner_lab/v4_structure_exit_full_replay_summary.json
+            artifacts/runner_lab/v4_structure_exit_full_replay_events.json
+            artifacts/v4_replay_summary.json
+            artifacts/v4_replay_signals.json
+          if-no-files-found: warn
+          retention-days: 30
