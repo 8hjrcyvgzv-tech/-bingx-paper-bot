@@ -1,0 +1,620 @@
+name: V4 Strong Radar A-B Replay
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - ".github/workflows/v4-strong-radar-ab.yml"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      V4_FROZEN_DATASET_ID: V4_CORE6_BINANCE_UM_5M_20260215_20260903_EBECBEDEEE03
+      V4_FROZEN_ROOT_SHA256: ebecbedeee03954dc9a8ff5fdabf764ebf92fb8cd90b30a659f8cbeaf9d67965
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download Frozen Dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: v4-frozen-core6-200d-dataset
+          path: frozen_dataset
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33924848219
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f v4_frozen_replay_harness.mjs
+          test -f v4_frozen_data_provider.mjs
+          test -f v4_replay_runner.mjs
+          test -f v4_radar.js
+          test -f v4_logic_test.mjs
+
+          node --check v4_frozen_replay_harness.mjs
+          node --check v4_frozen_data_provider.mjs
+          node --check v4_replay_runner.mjs
+          node --check v4_radar.js
+
+          grep -q 'strongScore: 7.0' v4_radar.js
+
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' \
+            v4_frozen_replay_harness.mjs \
+            v4_frozen_data_provider.mjs \
+            v4_replay_runner.mjs
+
+          echo "V4 STRONG RADAR A/B: READ-ONLY HISTORICAL REPLAY PASS"
+
+      - name: Logic Test
+        run: node v4_logic_test.mjs
+
+      - name: Run Frozen 100D Control
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf artifacts artifacts_radar
+
+          node v4_frozen_replay_harness.mjs
+
+          test -f artifacts/v4_replay_signals.json
+          test -f artifacts/v4_replay_summary.json
+
+      - name: Compare Baseline vs Existing Strong Radar Threshold
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts_radar
+
+          node --input-type=module <<'NODE'
+          import {
+            readFile,
+            writeFile,
+          } from "node:fs/promises";
+
+          const signals =
+            JSON.parse(
+              await readFile(
+                "artifacts/v4_replay_signals.json",
+                "utf8"
+              )
+            );
+
+          const replaySummary =
+            JSON.parse(
+              await readFile(
+                "artifacts/v4_replay_summary.json",
+                "utf8"
+              )
+            );
+
+          const STRONG_RADAR_SCORE =
+            7.0;
+
+          const DAY =
+            24 * 60 * 60 * 1000;
+
+          function n(v) {
+            const x =
+              Number(v);
+
+            return Number.isFinite(x)
+              ? x
+              : null;
+          }
+
+          function round(
+            v,
+            d = 4
+          ) {
+            if (
+              !Number.isFinite(v)
+            ) {
+              return null;
+            }
+
+            const m =
+              10 ** d;
+
+            return (
+              Math.round(
+                v * m
+              ) / m
+            );
+          }
+
+          function maxDD(
+            values
+          ) {
+            let eq = 0;
+            let peak = 0;
+            let dd = 0;
+
+            for (
+              const value of
+              values
+            ) {
+              eq += value;
+
+              peak =
+                Math.max(
+                  peak,
+                  eq
+                );
+
+              dd =
+                Math.max(
+                  dd,
+                  peak - eq
+                );
+            }
+
+            return dd;
+          }
+
+          function stats(
+            rows
+          ) {
+            const ordered =
+              [...rows]
+                .filter(
+                  (x) =>
+                    Number.isFinite(
+                      n(x.resultR)
+                    )
+                )
+                .sort(
+                  (a, b) =>
+                    n(a.timestampMs) -
+                    n(b.timestampMs)
+                );
+
+            const values =
+              ordered.map(
+                (x) =>
+                  n(x.resultR)
+              );
+
+            const wins =
+              values.filter(
+                (x) => x > 0
+              );
+
+            const losses =
+              values.filter(
+                (x) => x < 0
+              );
+
+            const total =
+              values.reduce(
+                (a, b) =>
+                  a + b,
+                0
+              );
+
+            const grossWin =
+              wins.reduce(
+                (a, b) =>
+                  a + b,
+                0
+              );
+
+            const grossLoss =
+              Math.abs(
+                losses.reduce(
+                  (a, b) =>
+                    a + b,
+                  0
+                )
+              );
+
+            return {
+              setups:
+                values.length,
+
+              wins:
+                wins.length,
+
+              losses:
+                losses.length,
+
+              winRatePct:
+                values.length
+                  ? round(
+                      (
+                        wins.length /
+                        values.length
+                      ) * 100,
+                      2
+                    )
+                  : null,
+
+              avgAccountPctPerSetup:
+                values.length
+                  ? round(
+                      total /
+                        values.length,
+                      4
+                    )
+                  : null,
+
+              cumulativePctPoints:
+                round(
+                  total,
+                  4
+                ),
+
+              maxDrawdownPctPoints:
+                round(
+                  maxDD(values),
+                  4
+                ),
+
+              profitFactor:
+                grossLoss > 0
+                  ? round(
+                      grossWin /
+                        grossLoss,
+                      4
+                    )
+                  : null,
+
+              equivalent1000Usd: {
+                avgPerSetupUsd:
+                  values.length
+                    ? round(
+                        (
+                          total /
+                          values.length
+                        ) * 10,
+                        2
+                      )
+                    : null,
+
+                cumulativeScoreUsd:
+                  round(
+                    total * 10,
+                    2
+                  ),
+
+                maxDrawdownScoreUsd:
+                  round(
+                    maxDD(values) *
+                      10,
+                    2
+                  ),
+              },
+            };
+          }
+
+          function group(
+            rows,
+            selector
+          ) {
+            const m =
+              new Map();
+
+            for (
+              const row of rows
+            ) {
+              const key =
+                selector(row);
+
+              if (
+                !m.has(key)
+              ) {
+                m.set(
+                  key,
+                  []
+                );
+              }
+
+              m.get(key)
+                .push(row);
+            }
+
+            return Object.fromEntries(
+              [...m.entries()]
+                .sort(
+                  ([a], [b]) =>
+                    String(a)
+                      .localeCompare(
+                        String(b)
+                      )
+                )
+                .map(
+                  ([key, value]) => [
+                    key,
+                    stats(value),
+                  ]
+                )
+            );
+          }
+
+          if (
+            !Array.isArray(signals) ||
+            signals.length !== 892
+          ) {
+            throw new Error(
+              `Expected exact frozen population 892, got ${signals?.length}`
+            );
+          }
+
+          const replayEnd =
+            Date.parse(
+              replaySummary
+                .replayWindow
+                .end
+            );
+
+          if (
+            !Number.isFinite(
+              replayEnd
+            )
+          ) {
+            throw new Error(
+              "Invalid replay end"
+            );
+          }
+
+          function windowRows(
+            days
+          ) {
+            const start =
+              replayEnd -
+              days * DAY +
+              1;
+
+            return signals.filter(
+              (x) =>
+                n(
+                  x.timestampMs
+                ) >= start
+            );
+          }
+
+          function strong(
+            rows
+          ) {
+            return rows.filter(
+              (x) =>
+                n(
+                  x.radarScore
+                ) >=
+                STRONG_RADAR_SCORE
+            );
+          }
+
+          const windows =
+            {};
+
+          for (
+            const days of
+            [30, 60, 100]
+          ) {
+            const base =
+              windowRows(days);
+
+            const filtered =
+              strong(base);
+
+            windows[
+              `${days}d`
+            ] = {
+              baseline:
+                stats(base),
+
+              strongRadar:
+                stats(filtered),
+
+              keptPct:
+                round(
+                  (
+                    filtered.length /
+                    base.length
+                  ) * 100,
+                  2
+                ),
+
+              filteredOut:
+                base.length -
+                filtered.length,
+            };
+          }
+
+          const strong100 =
+            strong(signals);
+
+          const output = {
+            version:
+              "V4_STRONG_RADAR_AB_1",
+
+            mode:
+              "HISTORICAL_REPLAY_ONLY",
+
+            dataset:
+              replaySummary
+                .dataset ??
+              null,
+
+            replayWindow:
+              replaySummary
+                .replayWindow ??
+              null,
+
+            isolatedChange: {
+              baseline:
+                "Use all existing STARTER signals.",
+
+              variant:
+                "Keep only STARTER signals whose radarScore is at least the already-existing V4_RADAR strongScore of 7.0.",
+
+              threshold:
+                STRONG_RADAR_SCORE,
+
+              note:
+                "7.0 is not invented for this experiment; it already exists in v4_radar.js as strongScore.",
+            },
+
+            integrity: {
+              exactFrozenPopulation:
+                signals.length,
+
+              productionFilesModified:
+                false,
+
+              scannerEnabled:
+                false,
+
+              paperOrdersEnabled:
+                false,
+
+              realOrdersEnabled:
+                false,
+            },
+
+            windows,
+
+            strongRadar100d: {
+              overall:
+                stats(
+                  strong100
+                ),
+
+              bySymbol:
+                group(
+                  strong100,
+                  (x) =>
+                    x.symbol
+                ),
+
+              byDirection:
+                group(
+                  strong100,
+                  (x) =>
+                    x.direction
+                ),
+
+              byStructure:
+                group(
+                  strong100,
+                  (x) =>
+                    x
+                      .structureStatus
+                ),
+            },
+
+            guardrails: [
+              "Percent values are risk-normalized percentage-point scores, not a compounded brokerage-account return.",
+              "The $1,000 translation uses 1 percentage point = $10 only for intuitive comparison.",
+              "30d/60d/100d windows are stability checks on the same frozen historical dataset, not independent future out-of-sample data.",
+              "Fees, slippage, funding, simultaneous-position overlap and cross-coin correlation are not modeled.",
+              "Binance official archive is accepted for historical price/structure proxy; BingX-native volume is not fully reproduced and DOGE volume proxy remains a caveat.",
+              "This experiment changes no production rule and grants no PAPER or LIVE permission."
+            ],
+          };
+
+          await writeFile(
+            "artifacts_radar/v4_strong_radar_ab_summary.json",
+            JSON.stringify(
+              output,
+              null,
+              2
+            ),
+            "utf8"
+          );
+
+          await writeFile(
+            "artifacts_radar/v4_strong_radar_events.json",
+            JSON.stringify(
+              strong100,
+              null,
+              2
+            ),
+            "utf8"
+          );
+
+          console.log(
+            "===== V4 STRONG RADAR A/B ====="
+          );
+
+          console.log(
+            JSON.stringify(
+              {
+                integrity:
+                  output.integrity,
+
+                isolatedChange:
+                  output
+                    .isolatedChange,
+
+                windows:
+                  output.windows,
+
+                bySymbol:
+                  output
+                    .strongRadar100d
+                    .bySymbol,
+
+                byDirection:
+                  output
+                    .strongRadar100d
+                    .byDirection,
+
+                byStructure:
+                  output
+                    .strongRadar100d
+                    .byStructure,
+              },
+              null,
+              2
+            )
+          );
+          NODE
+
+      - name: Show Result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f artifacts_radar/v4_strong_radar_ab_summary.json ]; then
+            cat artifacts_radar/v4_strong_radar_ab_summary.json
+          else
+            echo "Strong radar A/B summary was not generated."
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-strong-radar-ab-results
+          path: |
+            artifacts_radar/v4_strong_radar_ab_summary.json
+            artifacts_radar/v4_strong_radar_events.json
+            artifacts/v4_replay_summary.json
+            artifacts/v4_replay_signals.json
+          if-no-files-found: warn
+          retention-days: 30
