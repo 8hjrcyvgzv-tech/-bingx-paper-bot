@@ -1,0 +1,175 @@
+name: V4 Fresh OOS2 Locked Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - "v4_oos2_locked_portfolio.mjs"
+      - ".github/workflows/v4-oos2-locked-validation.yml"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+      # Fresh OOS2 ends the day BEFORE OOS1 dataset starts (2025-07-29).
+      OOS2_FIXED_END_DAY: "2025-07-28"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f v4_build_frozen_dataset.py
+          test -f v4_frozen_replay_harness.mjs
+          test -f v4_frozen_data_provider.mjs
+          test -f v4_structure_exit_runner.mjs
+          test -f v4_structure_exit_oos_costs.mjs
+          test -f v4_oos2_locked_portfolio.mjs
+
+          python -m py_compile v4_build_frozen_dataset.py
+          node --check v4_frozen_replay_harness.mjs
+          node --check v4_frozen_data_provider.mjs
+          node --check v4_structure_exit_runner.mjs
+          node --check v4_structure_exit_oos_costs.mjs
+          node --check v4_oos2_locked_portfolio.mjs
+
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' \
+            v4_oos2_locked_portfolio.mjs \
+            v4_structure_exit_oos_costs.mjs \
+            v4_structure_exit_runner.mjs \
+            v4_frozen_replay_harness.mjs \
+            v4_frozen_data_provider.mjs
+
+          echo "V4 FRESH OOS2: READ-ONLY SAFETY PASS"
+
+      - name: Build Fresh Frozen OOS2 Dataset
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf frozen_dataset .v4_oos2_builder.py
+          cp v4_build_frozen_dataset.py .v4_oos2_builder.py
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.v4_oos2_builder.py')
+          s = p.read_text(encoding='utf-8')
+          old = '    latest_day = latest_complete_archive_day()'
+          new = '''    fixed_end = os.getenv("OOS2_FIXED_END_DAY")\n    if not fixed_end:\n        raise RuntimeError("OOS2_FIXED_END_DAY is required")\n    latest_day = datetime.strptime(fixed_end, "%Y-%m-%d").replace(tzinfo=timezone.utc)\n    print(f"[OOS2-LOCK] fixed dataset end: {latest_day.date()}")'''
+          if s.count(old) != 1:
+              raise SystemExit('Could not uniquely patch fixed OOS2 end date')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+
+          V4_WARMUP_DAYS=100 \
+          V4_REPLAY_DAYS=100 \
+          V4_OUTCOME_TAIL_DAYS=1 \
+          V4_DATASET_SYMBOLS="$REPLAY_SYMBOLS" \
+          python .v4_oos2_builder.py
+
+          rm -f .v4_oos2_builder.py
+          test -f frozen_dataset/manifest.json
+          test -f frozen_dataset/build_summary.json
+
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          m = json.loads(Path('frozen_dataset/manifest.json').read_text())
+          if m.get('status') != 'FROZEN_EXACT_PASS':
+              raise SystemExit(f"OOS2 dataset build failed: {m.get('status')}")
+          layout = m['layout']
+          if layout['datasetStart'][:10] != '2025-01-09':
+              raise SystemExit(f"Unexpected OOS2 dataset start: {layout['datasetStart']}")
+          if layout['replayStart'][:10] != '2025-04-19':
+              raise SystemExit(f"Unexpected OOS2 replay start: {layout['replayStart']}")
+          if layout['replayEnd'][:10] != '2025-07-27':
+              raise SystemExit(f"Unexpected OOS2 replay end: {layout['replayEnd']}")
+          if layout['datasetEnd'][:10] != os.environ['OOS2_FIXED_END_DAY']:
+              raise SystemExit(f"Unexpected OOS2 dataset end: {layout['datasetEnd']}")
+          env_path = Path(os.environ['GITHUB_ENV'])
+          with env_path.open('a', encoding='utf-8') as f:
+              f.write(f"V4_FROZEN_DATASET_ID={m['datasetId']}\n")
+              f.write(f"V4_FROZEN_ROOT_SHA256={m['rootContentSha256']}\n")
+          print(json.dumps({
+              'datasetId': m['datasetId'],
+              'rootContentSha256': m['rootContentSha256'],
+              'layout': layout,
+          }, indent=2))
+          PY
+
+      - name: Run Fresh Frozen OOS2 Control
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts
+          node v4_frozen_replay_harness.mjs
+          test -f artifacts/v4_replay_signals.json
+          test -f artifacts/v4_replay_summary.json
+
+      - name: Build Locked Structure Exit A Costed Events
+        shell: bash
+        run: |
+          set -euo pipefail
+          node v4_structure_exit_oos_costs.mjs
+          test -f artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json
+          test -f artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+
+      - name: Run Locked Portfolio Policy On Fresh OOS2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node v4_oos2_locked_portfolio.mjs
+          test -f artifacts/oos2_locked/v4_oos2_locked_portfolio_summary.json
+
+      - name: Show Final OOS2 Result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f artifacts/oos2_locked/v4_oos2_locked_portfolio_summary.json ]; then
+            cat artifacts/oos2_locked/v4_oos2_locked_portfolio_summary.json
+          else
+            echo "Fresh OOS2 locked summary was not generated."
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-fresh-oos2-locked-results
+          path: |
+            frozen_dataset/manifest.json
+            frozen_dataset/build_summary.json
+            frozen_dataset/data/*.csv.gz
+            artifacts/v4_replay_summary.json
+            artifacts/v4_replay_signals.json
+            artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json
+            artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+            artifacts/oos2_locked/v4_oos2_locked_portfolio_summary.json
+          if-no-files-found: warn
+          retention-days: 30
