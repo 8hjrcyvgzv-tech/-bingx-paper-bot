@@ -1,0 +1,163 @@
+name: V4 Structure Exit Runner Replay
+
+on:
+  workflow_dispatch:
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      V4_FROZEN_DATASET_DIR: frozen_dataset
+      V4_FROZEN_DATASET_ID: V4_CORE6_BINANCE_UM_5M_20260215_20260903_EBECBEDEEE03
+      V4_FROZEN_ROOT_SHA256: ebecbedeee03954dc9a8ff5fdabf764ebf92fb8cd90b30a659f8cbeaf9d67965
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download Frozen Dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: v4-frozen-core6-200d-dataset
+          path: frozen_dataset
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33924848219
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f v4_structure_exit_runner.mjs
+          test -f v4_frozen_replay_harness.mjs
+          test -f v4_frozen_data_provider.mjs
+          test -f v4_replay_runner.mjs
+
+          node --check v4_structure_exit_runner.mjs
+          node --check v4_frozen_replay_harness.mjs
+          node --check v4_frozen_data_provider.mjs
+          node --check v4_replay_runner.mjs
+
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' \
+            v4_structure_exit_runner.mjs \
+            v4_frozen_replay_harness.mjs \
+            v4_frozen_data_provider.mjs \
+            v4_replay_runner.mjs
+
+          echo "V4 STRUCTURE EXIT RUNNER: READ-ONLY REPLAY PASS"
+
+      - name: Run Frozen 100D Control
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts
+          node v4_frozen_replay_harness.mjs
+
+          test -f artifacts/v4_replay_signals.json
+          test -f artifacts/v4_replay_summary.json
+
+      - name: Structure Exit Runner Lab
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/runner_lab
+
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+          import {
+            resolveStructureExitPlan,
+            V4_STRUCTURE_EXIT_RUNNER_VERSION,
+          } from "./v4_structure_exit_runner.mjs";
+
+          const signals =
+            JSON.parse(
+              await readFile(
+                "artifacts/v4_replay_signals.json",
+                "utf8"
+              )
+            );
+
+          // This workflow intentionally does NOT change production execution.
+          // It produces a structure-exit plan manifest for every Strong Radar event.
+          //
+          // NOTE:
+          // v4_replay_signals.json currently contains execution outcomes and scores,
+          // but not the full historical 1H/4H candle slices used at each timestamp.
+          // Therefore this first workflow validates the module, safety, allocations,
+          // and fallback behavior. Full structure-target PnL replay should call the
+          // same module from the frozen replay harness where candle slices exist.
+
+          const strong =
+            signals.filter(
+              (x) => Number(x?.radarScore) >= 7.0
+            );
+
+          const plans =
+            strong.map((x) =>
+              resolveStructureExitPlan({
+                direction: x.direction,
+                entry: x.entry,
+                stop: x.stop,
+                candles1h: [],
+                candles4h: [],
+              })
+            );
+
+          const output = {
+            version: "V4_STRUCTURE_EXIT_RUNNER_LAB_1",
+            moduleVersion:
+              V4_STRUCTURE_EXIT_RUNNER_VERSION,
+            mode: "HISTORICAL_REPLAY_ONLY",
+            strongRadarPopulation: strong.length,
+            allocation: {
+              tp1: 0.60,
+              tp2: 0.30,
+              runner: 0.10,
+            },
+            afterTp1Stop: "BREAKEVEN_ENTRY",
+            productionFilesModified: false,
+            scannerEnabled: false,
+            paperOrdersEnabled: false,
+            realOrdersEnabled: false,
+            note:
+              "Full structure-level PnL replay must call this module inside the frozen replay harness where point-in-time 1H/4H candles are available.",
+            samplePlans: plans.slice(0, 25),
+          };
+
+          await writeFile(
+            "artifacts/runner_lab/v4_structure_exit_runner_lab.json",
+            JSON.stringify(output, null, 2),
+            "utf8"
+          );
+
+          console.log(JSON.stringify(output, null, 2));
+          NODE
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-structure-exit-runner-replay-results
+          path: |
+            artifacts/runner_lab/v4_structure_exit_runner_lab.json
+            artifacts/v4_replay_summary.json
+            artifacts/v4_replay_signals.json
+          if-no-files-found: warn
+          retention-days: 30
