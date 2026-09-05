@@ -1,0 +1,275 @@
+name: V4 Regime Exit Adaptive V2 + Final OOS4 Gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - "v4_regime_exit_adaptive_v2.mjs"
+      - "v4_regime_exit_governor_v2.mjs"
+      - "v4_regime_exit_v2_lab.mjs"
+      - "v4_oos4_regime_exit_locked.mjs"
+      - ".github/workflows/v4-regime-exit-adaptive-oos4.yml"
+
+jobs:
+  regime_exit_oos4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+      OOS1_RUN_ID: "33975089837"
+      OOS1_ARTIFACT_NAME: "v4-structure-exit-oos-costs-results"
+      OOS2_RUN_ID: "33976255962"
+      OOS2_ARTIFACT_NAME: "v4-fresh-oos2-locked-results"
+      OOS3_RUN_ID: "33978725675"
+      OOS3_ARTIFACT_NAME: "v4-adaptive-risk-leverage-oos3-results"
+      # Final fresh block ends the day BEFORE OOS3 dataset starts (2024-06-22).
+      OOS4_FIXED_END_DAY: "2024-06-21"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f v4_build_frozen_dataset.py
+          test -f v4_frozen_replay_harness.mjs
+          test -f v4_frozen_data_provider.mjs
+          test -f v4_structure_exit_runner.mjs
+          test -f v4_structure_exit_oos_costs.mjs
+          test -f v4_regime_exit_adaptive_v2.mjs
+          test -f v4_regime_exit_governor_v2.mjs
+          test -f v4_regime_exit_v2_lab.mjs
+          test -f v4_oos4_regime_exit_locked.mjs
+
+          python -m py_compile v4_build_frozen_dataset.py
+          node --check v4_frozen_replay_harness.mjs
+          node --check v4_frozen_data_provider.mjs
+          node --check v4_structure_exit_runner.mjs
+          node --check v4_structure_exit_oos_costs.mjs
+          node --check v4_regime_exit_adaptive_v2.mjs
+          node --check v4_regime_exit_governor_v2.mjs
+          node --check v4_regime_exit_v2_lab.mjs
+          node --check v4_oos4_regime_exit_locked.mjs
+
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post|method[[:space:]]*=[[:space:]]*["'"'"']POST["'"'"']' \
+            v4_regime_exit_adaptive_v2.mjs \
+            v4_regime_exit_governor_v2.mjs \
+            v4_regime_exit_v2_lab.mjs \
+            v4_oos4_regime_exit_locked.mjs \
+            v4_structure_exit_oos_costs.mjs \
+            v4_structure_exit_runner.mjs \
+            v4_frozen_replay_harness.mjs \
+            v4_frozen_data_provider.mjs
+
+          echo "V4 REGIME EXIT ADAPTIVE V2 + OOS4: READ-ONLY SAFETY PASS"
+
+      - name: Download Consumed OOS1 OOS2 OOS3 Artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf consumed diagnostics/regime_exit_v2_lab
+          mkdir -p consumed/oos1 consumed/oos2 consumed/oos3
+          gh run download "$OOS1_RUN_ID" -n "$OOS1_ARTIFACT_NAME" -D consumed/oos1
+          gh run download "$OOS2_RUN_ID" -n "$OOS2_ARTIFACT_NAME" -D consumed/oos2
+          gh run download "$OOS3_RUN_ID" -n "$OOS3_ARTIFACT_NAME" -D consumed/oos3
+
+          for d in consumed/oos1 consumed/oos2 consumed/oos3; do
+            test -f "$d/frozen_dataset/manifest.json"
+            test -f "$d/artifacts/v4_replay_signals.json"
+            test -f "$d/artifacts/v4_replay_summary.json"
+            test -f "$d/artifacts/oos_costs/v4_structure_exit_oos_costs_events.json"
+            test -f "$d/artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json"
+          done
+
+      - name: Build Point In Time Governor Events On Consumed OOS1 OOS2 OOS3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_governor () {
+            local src="$1"
+            local out="$2"
+            export V4_FROZEN_DATASET_DIR="$src/frozen_dataset"
+            export V4_FROZEN_DATASET_ID="$(python -c "import json;print(json.load(open('$src/frozen_dataset/manifest.json'))['datasetId'])")"
+            export V4_FROZEN_ROOT_SHA256="$(python -c "import json;print(json.load(open('$src/frozen_dataset/manifest.json'))['rootContentSha256'])")"
+            REPLAY_SIGNALS_PATH="$src/artifacts/v4_replay_signals.json" \
+            REPLAY_SUMMARY_PATH="$src/artifacts/v4_replay_summary.json" \
+            STRUCTURE_EVENTS_PATH="$src/artifacts/oos_costs/v4_structure_exit_oos_costs_events.json" \
+            STRUCTURE_SUMMARY_PATH="$src/artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json" \
+            REGIME_GOV_OUTPUT_DIR="$out" \
+            node v4_regime_exit_governor_v2.mjs
+            test -f "$out/v4_regime_exit_governor_v2_events.json"
+            test -f "$out/v4_regime_exit_governor_v2_summary.json"
+          }
+
+          run_governor consumed/oos1 consumed/oos1/regime
+          run_governor consumed/oos2 consumed/oos2/regime
+          run_governor consumed/oos3 consumed/oos3/regime
+
+      - name: Consumed OOS1 OOS2 OOS3 Sanity And Lock
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          node v4_regime_exit_v2_lab.mjs
+          test -f diagnostics/regime_exit_v2_lab/v4_regime_exit_v2_lab_summary.json
+          decision="$(node -e "const fs=require('fs');const x=JSON.parse(fs.readFileSync('diagnostics/regime_exit_v2_lab/v4_regime_exit_v2_lab_summary.json','utf8'));process.stdout.write(x.decision)")"
+          echo "Consumed V2 lab decision: $decision"
+          if [ "$decision" = "LOCK_POLICY_FOR_FRESH_OOS4" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Final Fresh Frozen OOS4 Dataset
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf frozen_dataset artifacts .v4_oos4_builder.py
+          cp v4_build_frozen_dataset.py .v4_oos4_builder.py
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.v4_oos4_builder.py')
+          s = p.read_text(encoding='utf-8')
+          old = '    latest_day = latest_complete_archive_day()'
+          new = '''    fixed_end = os.getenv("OOS4_FIXED_END_DAY")\n    if not fixed_end:\n        raise RuntimeError("OOS4_FIXED_END_DAY is required")\n    latest_day = datetime.strptime(fixed_end, "%Y-%m-%d").replace(tzinfo=timezone.utc)\n    print(f"[OOS4-LOCK] fixed dataset end: {latest_day.date()}")'''
+          if s.count(old) != 1:
+              raise SystemExit('Could not uniquely patch fixed OOS4 end date')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+
+          V4_WARMUP_DAYS=100 \
+          V4_REPLAY_DAYS=100 \
+          V4_OUTCOME_TAIL_DAYS=1 \
+          V4_DATASET_SYMBOLS="$REPLAY_SYMBOLS" \
+          python .v4_oos4_builder.py
+
+          rm -f .v4_oos4_builder.py
+          test -f frozen_dataset/manifest.json
+          test -f frozen_dataset/build_summary.json
+
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          m = json.loads(Path('frozen_dataset/manifest.json').read_text())
+          if m.get('status') != 'FROZEN_EXACT_PASS':
+              raise SystemExit(f"OOS4 dataset build failed: {m.get('status')}")
+          layout = m['layout']
+          expected = {
+              'datasetStart': '2023-12-04',
+              'replayStart': '2024-03-13',
+              'replayEnd': '2024-06-20',
+              'datasetEnd': '2024-06-21',
+          }
+          for key, day in expected.items():
+              if not str(layout[key]).startswith(day):
+                  raise SystemExit(f"Unexpected OOS4 {key}: {layout[key]}")
+          with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as f:
+              f.write(f"V4_FROZEN_DATASET_DIR=frozen_dataset\n")
+              f.write(f"V4_FROZEN_DATASET_ID={m['datasetId']}\n")
+              f.write(f"V4_FROZEN_ROOT_SHA256={m['rootContentSha256']}\n")
+          print(json.dumps({'datasetId': m['datasetId'], 'rootContentSha256': m['rootContentSha256'], 'layout': layout}, indent=2))
+          PY
+
+      - name: Run Final Fresh OOS4 Control
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts
+          node v4_frozen_replay_harness.mjs
+          test -f artifacts/v4_replay_signals.json
+          test -f artifacts/v4_replay_summary.json
+
+      - name: Build OOS4 Structure Exit Costed Events
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node v4_structure_exit_oos_costs.mjs
+          test -f artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json
+          test -f artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+
+      - name: Apply Locked Regime Exit Governor To OOS4
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node v4_regime_exit_governor_v2.mjs
+          test -f artifacts/regime_exit_v2/v4_regime_exit_governor_v2_events.json
+          test -f artifacts/regime_exit_v2/v4_regime_exit_governor_v2_summary.json
+
+      - name: Run Final Locked OOS4 Gate
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node v4_oos4_regime_exit_locked.mjs
+          test -f artifacts/oos4_regime_exit/v4_oos4_regime_exit_locked_summary.json
+
+      - name: Show Final Result
+        if: always()
+        shell: bash
+        run: |
+          echo "===== CONSUMED V2 LAB ====="
+          if [ -f diagnostics/regime_exit_v2_lab/v4_regime_exit_v2_lab_summary.json ]; then
+            cat diagnostics/regime_exit_v2_lab/v4_regime_exit_v2_lab_summary.json
+          fi
+          echo "===== FINAL FRESH OOS4 ====="
+          if [ -f artifacts/oos4_regime_exit/v4_oos4_regime_exit_locked_summary.json ]; then
+            cat artifacts/oos4_regime_exit/v4_oos4_regime_exit_locked_summary.json
+          else
+            echo "OOS4 was not consumed because the consumed-data lock did not pass, or an earlier OOS4 step failed."
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-regime-exit-adaptive-v2-oos4-results
+          path: |
+            diagnostics/regime_exit_v2_lab/v4_regime_exit_v2_lab_summary.json
+            consumed/oos1/regime/v4_regime_exit_governor_v2_summary.json
+            consumed/oos1/regime/v4_regime_exit_governor_v2_events.json
+            consumed/oos2/regime/v4_regime_exit_governor_v2_summary.json
+            consumed/oos2/regime/v4_regime_exit_governor_v2_events.json
+            consumed/oos3/regime/v4_regime_exit_governor_v2_summary.json
+            consumed/oos3/regime/v4_regime_exit_governor_v2_events.json
+            frozen_dataset/manifest.json
+            frozen_dataset/build_summary.json
+            frozen_dataset/data/*.csv.gz
+            artifacts/v4_replay_summary.json
+            artifacts/v4_replay_signals.json
+            artifacts/oos_costs/v4_structure_exit_oos_costs_summary.json
+            artifacts/oos_costs/v4_structure_exit_oos_costs_events.json
+            artifacts/regime_exit_v2/v4_regime_exit_governor_v2_summary.json
+            artifacts/regime_exit_v2/v4_regime_exit_governor_v2_events.json
+            artifacts/oos4_regime_exit/v4_oos4_regime_exit_locked_summary.json
+          if-no-files-found: warn
+          retention-days: 30
