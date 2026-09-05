@@ -1,0 +1,244 @@
+name: V5 Shadow Expert Entry Core + Fresh OOS5 Gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v4-clean-core]
+    paths:
+      - "v5_shadow_expert_entry_core.py"
+      - ".github/workflows/v5-shadow-expert-entry-oos5.yml"
+
+jobs:
+  v5_entry_oos5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      OOS1_RUN_ID: "33975089837"
+      OOS1_ARTIFACT: "v4-structure-exit-oos-costs-results"
+      OOS2_RUN_ID: "33976255962"
+      OOS2_ARTIFACT: "v4-fresh-oos2-locked-results"
+      OOS3_RUN_ID: "33978725675"
+      OOS3_ARTIFACT: "v4-adaptive-risk-leverage-oos3-results"
+      OOS4_RUN_ID: "33980364327"
+      OOS4_ARTIFACT: "v4-regime-exit-adaptive-v2-oos4-results"
+      DEV_FIXED_END_DAY: "2026-09-03"
+      OOS5_FIXED_END_DAY: "2023-12-03"
+      REPLAY_SYMBOLS: BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,ZEC-USDT
+      REPLAY_DAYS: "100"
+      REPLAY_STEP_MIN: "15"
+      REPLAY_OUTCOME_HOURS: "24"
+      REPLAY_SIGNAL_COOLDOWN_HOURS: "6"
+
+    steps:
+      - name: Checkout V4
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Safety Check
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f v5_shadow_expert_entry_core.py
+          test -f v4_build_frozen_dataset.py
+          test -f v4_frozen_replay_harness.mjs
+          python -m py_compile v5_shadow_expert_entry_core.py v4_build_frozen_dataset.py
+          node --check v4_frozen_replay_harness.mjs
+          ! grep -Eq '/trade/order|/trade/batchOrders|/order/test|requests\.post' \
+            v5_shadow_expert_entry_core.py v4_frozen_replay_harness.mjs
+          echo "V5 ENTRY PROOF: READ-ONLY SAFETY PASS"
+
+      - name: Download Consumed OOS1 OOS2 OOS3 OOS4
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf consumed
+          mkdir -p consumed/oos1 consumed/oos2 consumed/oos3 consumed/oos4
+          gh run download "$OOS1_RUN_ID" -n "$OOS1_ARTIFACT" -D consumed/oos1
+          gh run download "$OOS2_RUN_ID" -n "$OOS2_ARTIFACT" -D consumed/oos2
+          gh run download "$OOS3_RUN_ID" -n "$OOS3_ARTIFACT" -D consumed/oos3
+          gh run download "$OOS4_RUN_ID" -n "$OOS4_ARTIFACT" -D consumed/oos4
+          for n in 1 2 3 4; do
+            test -f "consumed/oos${n}/artifacts/v4_replay_signals.json"
+            test -d "consumed/oos${n}/frozen_dataset/data"
+          done
+
+      - name: Rebuild Consumed DEV Control
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf frozen_dataset artifacts consumed/dev .v5_dev_builder.py
+          cp v4_build_frozen_dataset.py .v5_dev_builder.py
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('.v5_dev_builder.py')
+          s=p.read_text(encoding='utf-8')
+          old='    latest_day = latest_complete_archive_day()'
+          new='    fixed_end = os.getenv("DEV_FIXED_END_DAY")\n    if not fixed_end:\n        raise RuntimeError("DEV_FIXED_END_DAY is required")\n    latest_day = datetime.strptime(fixed_end, "%Y-%m-%d").replace(tzinfo=timezone.utc)\n    print(f"[V5-DEV] fixed dataset end: {latest_day.date()}")'
+          if s.count(old) != 1:
+              raise SystemExit('Could not uniquely patch consumed DEV end date')
+          p.write_text(s.replace(old,new), encoding='utf-8')
+          PY
+          V4_WARMUP_DAYS=100 \
+          V4_REPLAY_DAYS=100 \
+          V4_OUTCOME_TAIL_DAYS=1 \
+          V4_DATASET_SYMBOLS="$REPLAY_SYMBOLS" \
+          python .v5_dev_builder.py
+          rm -f .v5_dev_builder.py
+          test -f frozen_dataset/manifest.json
+          mkdir -p consumed/dev
+          mv frozen_dataset consumed/dev/frozen_dataset
+          python - <<'PY'
+          import json, os
+          m=json.load(open('consumed/dev/frozen_dataset/manifest.json'))
+          if m.get('status') != 'FROZEN_EXACT_PASS':
+              raise SystemExit(f"DEV dataset failed: {m.get('status')}")
+          expected={'datasetStart':'2026-02-15','replayStart':'2026-05-26','replayEnd':'2026-09-02','datasetEnd':'2026-09-03'}
+          for k,v in expected.items():
+              if not str(m['layout'][k]).startswith(v):
+                  raise SystemExit(f"Unexpected DEV {k}: {m['layout'][k]}")
+          expected_id='V4_CORE6_BINANCE_UM_5M_20260215_20260903_EBECBEDEEE03'
+          expected_root='ebecbedeee03954dc9a8ff5fdabf764ebf92fb8cd90b30a659f8cbeaf9d67965'
+          if m.get('datasetId') != expected_id or m.get('rootContentSha256') != expected_root:
+              raise SystemExit(f"DEV frozen identity drift: id={m.get('datasetId')} root={m.get('rootContentSha256')}")
+          print(json.dumps({'datasetId':m['datasetId'],'root':m['rootContentSha256'],'layout':m['layout']},indent=2))
+          PY
+          DEV_DATASET_ID="$(python -c 'import json; print(json.load(open("consumed/dev/frozen_dataset/manifest.json"))["datasetId"])')"
+          DEV_ROOT_SHA="$(python -c 'import json; print(json.load(open("consumed/dev/frozen_dataset/manifest.json"))["rootContentSha256"])')"
+          V4_FROZEN_DATASET_DIR=consumed/dev/frozen_dataset \
+          V4_FROZEN_DATASET_ID="$DEV_DATASET_ID" \
+          V4_FROZEN_ROOT_SHA256="$DEV_ROOT_SHA" \
+          node v4_frozen_replay_harness.mjs
+          test -f artifacts/v4_replay_signals.json
+          mv artifacts consumed/dev/artifacts
+
+      - name: Consumed DEV OOS1 OOS2 OOS3 OOS4 Lock
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf diagnostics/v5_entry
+          mkdir -p diagnostics/v5_entry
+          python v5_shadow_expert_entry_core.py consumed \
+            --dev consumed/dev \
+            --oos1 consumed/oos1 \
+            --oos2 consumed/oos2 \
+            --oos3 consumed/oos3 \
+            --oos4 consumed/oos4 \
+            --output diagnostics/v5_entry/v5_consumed_lock.json
+          decision="$(python -c "import json; print(json.load(open('diagnostics/v5_entry/v5_consumed_lock.json'))['decision'])")"
+          echo "V5 consumed decision: $decision"
+          if [ "$decision" = "LOCK_V5_EXPERT_ENTRY_FOR_FRESH_OOS5" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Fresh Frozen OOS5 Dataset
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf frozen_dataset artifacts .v5_oos5_builder.py
+          cp v4_build_frozen_dataset.py .v5_oos5_builder.py
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('.v5_oos5_builder.py')
+          s=p.read_text(encoding='utf-8')
+          old='    latest_day = latest_complete_archive_day()'
+          new='    fixed_end = os.getenv("OOS5_FIXED_END_DAY")\n    if not fixed_end:\n        raise RuntimeError("OOS5_FIXED_END_DAY is required")\n    latest_day = datetime.strptime(fixed_end, "%Y-%m-%d").replace(tzinfo=timezone.utc)\n    print(f"[OOS5-LOCK] fixed dataset end: {latest_day.date()}")'
+          if s.count(old) != 1:
+              raise SystemExit('Could not uniquely patch fixed OOS5 end date')
+          p.write_text(s.replace(old,new), encoding='utf-8')
+          PY
+          V4_WARMUP_DAYS=100 \
+          V4_REPLAY_DAYS=100 \
+          V4_OUTCOME_TAIL_DAYS=1 \
+          V4_DATASET_SYMBOLS="$REPLAY_SYMBOLS" \
+          python .v5_oos5_builder.py
+          rm -f .v5_oos5_builder.py
+          test -f frozen_dataset/manifest.json
+          python - <<'PY'
+          import json, os
+          m=json.load(open('frozen_dataset/manifest.json'))
+          if m.get('status') != 'FROZEN_EXACT_PASS':
+              raise SystemExit(f"OOS5 dataset failed: {m.get('status')}")
+          expected={'datasetStart':'2023-05-17','replayStart':'2023-08-25','replayEnd':'2023-12-02','datasetEnd':'2023-12-03'}
+          for k,v in expected.items():
+              if not str(m['layout'][k]).startswith(v):
+                  raise SystemExit(f"Unexpected OOS5 {k}: {m['layout'][k]}")
+          with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as f:
+              f.write(f"V4_FROZEN_DATASET_ID={m['datasetId']}\n")
+              f.write(f"V4_FROZEN_ROOT_SHA256={m['rootContentSha256']}\n")
+          print(json.dumps({'datasetId':m['datasetId'],'root':m['rootContentSha256'],'layout':m['layout']},indent=2))
+          PY
+
+      - name: Run Fresh OOS5 Control Replay
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        env:
+          V4_FROZEN_DATASET_DIR: frozen_dataset
+        run: |
+          set -euo pipefail
+          rm -rf artifacts
+          node v4_frozen_replay_harness.mjs
+          test -f artifacts/v4_replay_signals.json
+          test -f artifacts/v4_replay_summary.json
+
+      - name: Run Locked Fresh OOS5 Entry Gate
+        if: steps.lock.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/v5_entry_oos5
+          python v5_shadow_expert_entry_core.py fresh \
+            --lock diagnostics/v5_entry/v5_consumed_lock.json \
+            --root . \
+            --manifest frozen_dataset/manifest.json \
+            --output artifacts/v5_entry_oos5/v5_oos5_entry_summary.json
+
+      - name: Show Final Result
+        if: always()
+        shell: bash
+        run: |
+          echo "===== V5 CONSUMED ENTRY LOCK ====="
+          if [ -f diagnostics/v5_entry/v5_consumed_lock.json ]; then cat diagnostics/v5_entry/v5_consumed_lock.json; fi
+          echo "===== FRESH OOS5 ENTRY GATE ====="
+          if [ -f artifacts/v5_entry_oos5/v5_oos5_entry_summary.json ]; then
+            cat artifacts/v5_entry_oos5/v5_oos5_entry_summary.json
+          else
+            echo "OOS5 did not run because consumed V5 entry lock failed."
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v5-shadow-expert-entry-oos5-results
+          path: |
+            diagnostics/v5_entry/v5_consumed_lock.json
+            consumed/dev/frozen_dataset/manifest.json
+            consumed/dev/artifacts/v4_replay_summary.json
+            frozen_dataset/manifest.json
+            frozen_dataset/build_summary.json
+            frozen_dataset/data/*.csv.gz
+            artifacts/v4_replay_summary.json
+            artifacts/v4_replay_signals.json
+            artifacts/v5_entry_oos5/v5_oos5_entry_summary.json
+          if-no-files-found: warn
+          retention-days: 30
