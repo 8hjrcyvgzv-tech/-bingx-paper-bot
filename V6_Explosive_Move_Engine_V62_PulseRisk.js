@@ -3551,6 +3551,52 @@ class PaperTracker extends BasePaperTracker {
     return {ok:true,count:arr.length,completed,samples:arr.slice(0,200)};
   }
 
+
+  async getV6ForwardStats(){
+    const samples=(await this.state.storage.get("v6_forward_labels"))||[];
+    const arr=Array.isArray(samples)?samples:[];
+    const bands=[
+      {name:"5.5-5.99",min:5.5,max:6},
+      {name:"6.0-6.99",min:6,max:7},
+      {name:"7.0-7.99",min:7,max:8},
+      {name:"8.0-8.99",min:8,max:9},
+      {name:"9.0-10",min:9,max:10.01}
+    ];
+    const horizons=["30","120","360"];
+    const r3=v=>Number.isFinite(v)?Math.round(v*1000)/1000:null;
+    const mean=xs=>{const v=xs.map(Number).filter(Number.isFinite);return v.length?r3(v.reduce((a,b)=>a+b,0)/v.length):null;};
+    const pct=(n,d)=>d?Math.round((100*n/d)*10)/10:null;
+    const summarize=(rows,h)=>{
+      const vals=rows.map(x=>x?.horizons?.[h]).filter(Boolean);
+      const rets=vals.map(x=>Number(x.returnPct)).filter(Number.isFinite);
+      const mfes=vals.map(x=>Number(x.mfePct)).filter(Number.isFinite);
+      const maes=vals.map(x=>Number(x.maePct)).filter(Number.isFinite);
+      return {
+        samples:vals.length,
+        avgReturnPct:mean(rets),avgMfePct:mean(mfes),avgMaePct:mean(maes),
+        positiveReturnPct:pct(rets.filter(x=>x>0).length,rets.length),
+        mfe1HitPct:pct(mfes.filter(x=>x>=1).length,mfes.length),
+        mfe2HitPct:pct(mfes.filter(x=>x>=2).length,mfes.length),
+        mfe3HitPct:pct(mfes.filter(x=>x>=3).length,mfes.length),
+        mae1WorsePct:pct(maes.filter(x=>x<=-1).length,maes.length),
+        mae2WorsePct:pct(maes.filter(x=>x<=-2).length,maes.length)
+      };
+    };
+    const summarizeAll=rows=>Object.fromEntries(horizons.map(h=>[h,summarize(rows,h)]));
+    const byScoreBand={};
+    for(const b of bands){
+      const rows=arr.filter(x=>{const v=Number(x?.preRankScore);return Number.isFinite(v)&&v>=b.min&&v<b.max;});
+      const longs=rows.filter(x=>x?.direction==="LONG"),shorts=rows.filter(x=>x?.direction==="SHORT");
+      byScoreBand[b.name]={total:rows.length,ALL:summarizeAll(rows),LONG:{total:longs.length,horizons:summarizeAll(longs)},SHORT:{total:shorts.length,horizons:summarizeAll(shorts)}};
+    }
+    return {
+      ok:true,generatedAt:new Date().toISOString(),sampleCount:arr.length,
+      note:"preRankScore = radarScore; final V6 Explosion Score degildir",
+      completed:Object.fromEntries(horizons.map(h=>[h,arr.filter(x=>x?.horizons?.[h]).length])),
+      all:summarizeAll(arr),byScoreBand
+    };
+  }
+
   async updateV6DecisionLog(rows,scannedAt){
     const ts=Date.parse(scannedAt)||Date.now(),iso=new Date(ts).toISOString();
     let state=(await this.state.storage.get("v6_decision_watch"))||{};
@@ -3648,6 +3694,7 @@ class PaperTracker extends BasePaperTracker {
     const migration=await this.ensureV219Migration();
     const url=new URL(request.url);
     if(url.pathname==="/v6-forward-labels")return Response.json(await this.getV6ForwardLabels());
+    if(url.pathname==="/v6-forward-stats")return Response.json(await this.getV6ForwardStats());
     if(url.pathname==="/v6-decision-log"){
       if(request.method==="POST"){const body=await request.json().catch(()=>({}));return Response.json(await this.updateV6DecisionLog(body?.rows,body?.scannedAt));}
       return Response.json(await this.getV6DecisionLog());
@@ -3850,6 +3897,7 @@ const __main_default = {
       try{return Response.json(await paperSnapshot(env),{headers:{"cache-control":"no-store"}});}catch(e){return Response.json({ok:false,error:String(e?.message||e)},{status:500});}
     }
     if(url.pathname==="/v6-forward-labels")return trackerStub(env).fetch("https://paper.local/v6-forward-labels");
+    if(url.pathname==="/v6-forward-stats")return trackerStub(env).fetch("https://paper.local/v6-forward-stats");
     if(url.pathname==="/v6-decision-log")return trackerStub(env).fetch("https://paper.local/v6-decision-log");
     if(url.pathname==="/v219-migration"||url.pathname==="/v219-archive")return trackerStub(env).fetch(`https://paper.local${url.pathname}`);
 
