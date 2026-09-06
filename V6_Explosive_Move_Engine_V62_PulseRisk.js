@@ -3525,7 +3525,14 @@ class PaperTracker extends BasePaperTracker {
       .filter(x=>["LONG","SHORT"].includes(x?.directionHint)&&Number(x?.radarScore)>=V6.forwardLabelMinScore)
       .slice(0,V6.forwardLabelTopN);
     const ids=new Set(samples.map(x=>x.id));
+    const bucketSuffix=`:${bucket}`;
+    const currentBucketIds=new Set(
+      samples
+        .filter(x=>String(x?.id||"").endsWith(bucketSuffix))
+        .map(x=>x.id)
+    );
     for(const x of top){
+      if(currentBucketIds.size>=V6.forwardLabelTopN)break;
       const id=`${x.symbol}:${x.directionHint}:${bucket}`;
       if(ids.has(id))continue;
       const entry=priceMap.get(String(x.symbol));
@@ -3537,8 +3544,23 @@ class PaperTracker extends BasePaperTracker {
         volExpansionX:x.volExpansionX,bookBuyPct:x.bookBuyPct,mfePct:0,maePct:0,horizons:{},done:false
       });
       ids.add(id);
+      currentBucketIds.add(id);
     }
-    samples=samples.sort((a,b)=>Date.parse(b.startAt)-Date.parse(a.startAt)).slice(0,600);
+
+    // Never evict a live forward-label sample merely because the array hit a count cap.
+    // Pending samples are kept long enough to reach the 360-minute horizon (+120m grace).
+    // Only completed samples are count-capped, so 30/120/360 cohorts can all graduate.
+    const maxHorizonMin=Math.max(...V6.horizonsMin);
+    const pendingGraceMin=120;
+    const completedCap=600;
+    const ageMinOf=(x)=>(ts-Date.parse(x?.startAt||0))/60000;
+    const pending=samples.filter(x=>!x?.done&&ageMinOf(x)<=maxHorizonMin+pendingGraceMin);
+    const completedSamples=samples
+      .filter(x=>x?.done)
+      .sort((a,b)=>Date.parse(b.startAt)-Date.parse(a.startAt))
+      .slice(0,completedCap);
+    samples=[...pending,...completedSamples]
+      .sort((a,b)=>Date.parse(b.startAt)-Date.parse(a.startAt));
     await this.state.storage.put("v6_forward_labels",samples);
     return samples;
   }
@@ -3549,52 +3571,6 @@ class PaperTracker extends BasePaperTracker {
     const completed={30:0,120:0,360:0};
     for(const s of arr)for(const h of Object.keys(completed))if(s?.horizons?.[h])completed[h]++;
     return {ok:true,count:arr.length,completed,samples:arr.slice(0,200)};
-  }
-
-
-  async getV6ForwardStats(){
-    const samples=(await this.state.storage.get("v6_forward_labels"))||[];
-    const arr=Array.isArray(samples)?samples:[];
-    const bands=[
-      {name:"5.5-5.99",min:5.5,max:6},
-      {name:"6.0-6.99",min:6,max:7},
-      {name:"7.0-7.99",min:7,max:8},
-      {name:"8.0-8.99",min:8,max:9},
-      {name:"9.0-10",min:9,max:10.01}
-    ];
-    const horizons=["30","120","360"];
-    const r3=v=>Number.isFinite(v)?Math.round(v*1000)/1000:null;
-    const mean=xs=>{const v=xs.map(Number).filter(Number.isFinite);return v.length?r3(v.reduce((a,b)=>a+b,0)/v.length):null;};
-    const pct=(n,d)=>d?Math.round((100*n/d)*10)/10:null;
-    const summarize=(rows,h)=>{
-      const vals=rows.map(x=>x?.horizons?.[h]).filter(Boolean);
-      const rets=vals.map(x=>Number(x.returnPct)).filter(Number.isFinite);
-      const mfes=vals.map(x=>Number(x.mfePct)).filter(Number.isFinite);
-      const maes=vals.map(x=>Number(x.maePct)).filter(Number.isFinite);
-      return {
-        samples:vals.length,
-        avgReturnPct:mean(rets),avgMfePct:mean(mfes),avgMaePct:mean(maes),
-        positiveReturnPct:pct(rets.filter(x=>x>0).length,rets.length),
-        mfe1HitPct:pct(mfes.filter(x=>x>=1).length,mfes.length),
-        mfe2HitPct:pct(mfes.filter(x=>x>=2).length,mfes.length),
-        mfe3HitPct:pct(mfes.filter(x=>x>=3).length,mfes.length),
-        mae1WorsePct:pct(maes.filter(x=>x<=-1).length,maes.length),
-        mae2WorsePct:pct(maes.filter(x=>x<=-2).length,maes.length)
-      };
-    };
-    const summarizeAll=rows=>Object.fromEntries(horizons.map(h=>[h,summarize(rows,h)]));
-    const byScoreBand={};
-    for(const b of bands){
-      const rows=arr.filter(x=>{const v=Number(x?.preRankScore);return Number.isFinite(v)&&v>=b.min&&v<b.max;});
-      const longs=rows.filter(x=>x?.direction==="LONG"),shorts=rows.filter(x=>x?.direction==="SHORT");
-      byScoreBand[b.name]={total:rows.length,ALL:summarizeAll(rows),LONG:{total:longs.length,horizons:summarizeAll(longs)},SHORT:{total:shorts.length,horizons:summarizeAll(shorts)}};
-    }
-    return {
-      ok:true,generatedAt:new Date().toISOString(),sampleCount:arr.length,
-      note:"preRankScore = radarScore; final V6 Explosion Score degildir",
-      completed:Object.fromEntries(horizons.map(h=>[h,arr.filter(x=>x?.horizons?.[h]).length])),
-      all:summarizeAll(arr),byScoreBand
-    };
   }
 
   async updateV6DecisionLog(rows,scannedAt){
@@ -3694,7 +3670,6 @@ class PaperTracker extends BasePaperTracker {
     const migration=await this.ensureV219Migration();
     const url=new URL(request.url);
     if(url.pathname==="/v6-forward-labels")return Response.json(await this.getV6ForwardLabels());
-    if(url.pathname==="/v6-forward-stats")return Response.json(await this.getV6ForwardStats());
     if(url.pathname==="/v6-decision-log"){
       if(request.method==="POST"){const body=await request.json().catch(()=>({}));return Response.json(await this.updateV6DecisionLog(body?.rows,body?.scannedAt));}
       return Response.json(await this.getV6DecisionLog());
@@ -3897,7 +3872,6 @@ const __main_default = {
       try{return Response.json(await paperSnapshot(env),{headers:{"cache-control":"no-store"}});}catch(e){return Response.json({ok:false,error:String(e?.message||e)},{status:500});}
     }
     if(url.pathname==="/v6-forward-labels")return trackerStub(env).fetch("https://paper.local/v6-forward-labels");
-    if(url.pathname==="/v6-forward-stats")return trackerStub(env).fetch("https://paper.local/v6-forward-stats");
     if(url.pathname==="/v6-decision-log")return trackerStub(env).fetch("https://paper.local/v6-decision-log");
     if(url.pathname==="/v219-migration"||url.pathname==="/v219-archive")return trackerStub(env).fetch(`https://paper.local${url.pathname}`);
 
